@@ -10,6 +10,7 @@ const GATEWAY_CONNECT_TIMEOUT_MS = 10_000;
 const GATEWAY_REQUEST_TIMEOUT_MS = 10_000;
 const HOOKS_WAKE_TIMEOUT_MS = 5_000;
 const FALLBACK_RESPONSE_TEXT = "Request accepted (no agent dispatch available)";
+const TASK_CONTEXT_CACHE_LIMIT = 10_000;
 
 function pickAgentId(requestContext: RequestContext, fallbackAgentId: string): string {
   const msg = requestContext.userMessage as unknown as Record<string, unknown> | undefined;
@@ -453,7 +454,7 @@ export class OpenClawAgentExecutor implements AgentExecutor {
     const agentId = pickAgentId(requestContext, this.defaultAgentId);
     const taskId = requestContext.taskId;
     const contextId = requestContext.contextId;
-    this.taskContextByTaskId.set(taskId, contextId);
+    this.rememberTaskContext(taskId, contextId);
 
     // Publish initial "working" state so the task is trackable during async dispatch
     const workingTask: Task = {
@@ -510,7 +511,6 @@ export class OpenClawAgentExecutor implements AgentExecutor {
     };
 
     eventBus.publish(completedTask);
-    this.taskContextByTaskId.delete(taskId);
     eventBus.finished();
   }
 
@@ -556,6 +556,19 @@ export class OpenClawAgentExecutor implements AgentExecutor {
         `a2a-gateway: preferred gateway dispatch failed (${preferredMessage}); falling back to dispatchToAgent`,
       );
       return await this.dispatchViaLegacyApi(agentId, taskId, contextId, userMessage);
+    }
+  }
+
+  private rememberTaskContext(taskId: string, contextId: string): void {
+    if (this.taskContextByTaskId.has(taskId)) {
+      this.taskContextByTaskId.delete(taskId);
+    }
+    this.taskContextByTaskId.set(taskId, contextId);
+    if (this.taskContextByTaskId.size > TASK_CONTEXT_CACHE_LIMIT) {
+      const oldestTaskId = this.taskContextByTaskId.keys().next().value;
+      if (oldestTaskId) {
+        this.taskContextByTaskId.delete(oldestTaskId);
+      }
     }
   }
 
