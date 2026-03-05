@@ -109,6 +109,7 @@ function parseConfig(raw: unknown): GatewayConfig {
   const server = asObject(config.server);
   const security = asObject(config.security);
   const routing = asObject(config.routing);
+  const timeouts = asObject(config.timeouts);
 
   const inboundAuth = asString(security.inboundAuth, "none") as InboundAuth;
 
@@ -125,6 +126,9 @@ function parseConfig(raw: unknown): GatewayConfig {
     },
     routing: {
       defaultAgentId: asString(routing.defaultAgentId, "default"),
+    },
+    timeouts: {
+      agentResponseTimeoutMs: asNumber(timeouts.agentResponseTimeoutMs, 300_000),
     },
   };
 }

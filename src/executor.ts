@@ -5,7 +5,7 @@ import type { AgentExecutor, ExecutionEventBus, RequestContext } from "@a2a-js/s
 
 import type { GatewayConfig, OpenClawPluginApi } from "./types.js";
 
-const AGENT_RESPONSE_TIMEOUT_MS = 30_000;
+const DEFAULT_AGENT_RESPONSE_TIMEOUT_MS = 300_000;
 const GATEWAY_CONNECT_TIMEOUT_MS = 10_000;
 const GATEWAY_REQUEST_TIMEOUT_MS = 10_000;
 const HOOKS_WAKE_TIMEOUT_MS = 5_000;
@@ -442,11 +442,19 @@ class GatewayRpcConnection {
 export class OpenClawAgentExecutor implements AgentExecutor {
   private readonly api: OpenClawPluginApi;
   private readonly defaultAgentId: string;
+  private readonly agentResponseTimeoutMs: number;
   private readonly taskContextByTaskId: Map<string, string>;
 
   constructor(api: OpenClawPluginApi, config: GatewayConfig) {
     this.api = api;
     this.defaultAgentId = config.routing.defaultAgentId;
+
+    const configured = config.timeouts?.agentResponseTimeoutMs;
+    this.agentResponseTimeoutMs =
+      typeof configured === "number" && Number.isFinite(configured) && configured >= 1000
+        ? configured
+        : DEFAULT_AGENT_RESPONSE_TIMEOUT_MS;
+
     this.taskContextByTaskId = new Map();
   }
 
@@ -585,7 +593,7 @@ export class OpenClawAgentExecutor implements AgentExecutor {
       const finalPayload = await gateway.request(
         "agent",
         agentParams,
-        AGENT_RESPONSE_TIMEOUT_MS,
+        this.agentResponseTimeoutMs,
         true,
       );
       const finalBody = asObject(finalPayload);

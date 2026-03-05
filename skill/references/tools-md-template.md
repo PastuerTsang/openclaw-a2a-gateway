@@ -37,7 +37,8 @@ The script uses `@a2a-js/sdk` ClientFactory to:
 
 ### Notes
 
-- Allow up to 120s timeout for complex tasks
+- For long-running prompts (multi-round discussions, long summaries), use async task mode:
+  - add: `--non-blocking --wait --timeout-ms 300000 --poll-ms 1000`
 - If the peer returns an error, check the token and network connectivity
 - The script handles messageId generation and response parsing automatically
 ```

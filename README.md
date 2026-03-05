@@ -157,6 +157,23 @@ node <PLUGIN_PATH>/skill/scripts/a2a-send.mjs \
 
 The script uses `@a2a-js/sdk` ClientFactory to auto-discover the Agent Card and select the best transport.
 
+### Async task mode (recommended for long-running prompts)
+
+For long prompts or multi-round discussions, avoid blocking a single request. Use non-blocking mode + polling:
+
+```bash
+node <PLUGIN_PATH>/skill/scripts/a2a-send.mjs \
+  --peer-url http://<PEER_IP>:18800 \
+  --token <PEER_TOKEN> \
+  --non-blocking \
+  --wait \
+  --timeout-ms 300000 \
+  --poll-ms 1000 \
+  --message "Discuss A2A advantages in 3 rounds and provide final conclusion"
+```
+
+This sends `configuration.blocking=false` and then polls `tasks/get` until the task reaches a terminal state.
+
 ### Target a specific OpenClaw agentId (OpenClaw extension)
 
 By default, the peer routes inbound A2A messages to `routing.defaultAgentId` (often `main`).
@@ -329,20 +346,29 @@ node <PLUGIN_PATH>/skill/scripts/a2a-send.mjs \
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/.well-known/agent-card.json` | GET | Agent Card (discovery) |
+| `/.well-known/agent-card.json` | GET | Agent Card (discovery) *(legacy alias: `/.well-known/agent.json`)* |
 | `/a2a/jsonrpc` | POST | A2A JSON-RPC (message/send) |
 
 ## Troubleshooting
 
 ### "Request accepted (no agent dispatch available)"
 
-Your OpenClaw agent has no AI provider configured. Run:
+This means the A2A request was accepted by the gateway, but the underlying OpenClaw agent dispatch did not complete.
+
+Common causes:
+
+1) **No AI provider configured** on the target OpenClaw instance.
 
 ```bash
 openclaw config get auth.profiles
 ```
 
-Make sure at least one auth profile is set up (e.g., `openai-codex`, `anthropic`, etc.).
+2) **Agent dispatch timed out** (long-running prompt / multi-round discussion).
+
+Fix options:
+- Use async task mode from the sender: `--non-blocking --wait`
+- Increase the plugin timeout: `plugins.entries.a2a-gateway.config.timeouts.agentResponseTimeoutMs` (default: 300000)
+
 
 ### Agent Card returns 404
 
@@ -436,6 +462,16 @@ Once installed, tell your agent:
 - "Add an A2A peer"
 
 The agent will follow the skill's procedure automatically.
+
+## TODO / Roadmap
+
+Production-grade async task mode (PRs welcome):
+
+- Persist tasks to disk (replace `InMemoryTaskStore` with a durable store) so `tasks/get` survives gateway restarts
+- Provide a streaming-first path (SSE / sendMessageStream) for incremental outputs
+- Push notifications support (store + sender) for long-running tasks
+- Concurrency limits / queueing for inbound A2A dispatch to protect the OpenClaw gateway
+- Observability: structured logs + metrics for task durations/timeouts
 
 ## License
 

@@ -157,6 +157,23 @@ node <插件路径>/skill/scripts/a2a-send.mjs \
 
 脚本使用 `@a2a-js/sdk` ClientFactory 自动发现 Agent Card 并选择最佳传输协议。
 
+### 异步 task 模式（推荐用于耗时长的任务）
+
+对于长回复/多轮讨论，建议使用 non-blocking + 轮询：
+
+```bash
+node <插件路径>/skill/scripts/a2a-send.mjs \
+  --peer-url http://<对等方IP>:18800 \
+  --token <对等方Token> \
+  --non-blocking \
+  --wait \
+  --timeout-ms 300000 \
+  --poll-ms 1000 \
+  --message "用 3 轮讨论 A2A 通信的优势并给出最终结论"
+```
+
+该模式会发送 `configuration.blocking=false`，然后通过 `tasks/get` 轮询直到任务进入终态。
+
 ### 指定路由到某个 OpenClaw agentId（OpenClaw 扩展）
 
 默认情况下，对端会把入站 A2A 消息路由到 `routing.defaultAgentId`（通常是 `main`）。
@@ -336,13 +353,22 @@ node <插件路径>/skill/scripts/a2a-send.mjs \
 
 ### "Request accepted (no agent dispatch available)"
 
-你的 OpenClaw Agent 没有配置 AI Provider。检查：
+这表示 A2A 网关收到了请求，但底层 OpenClaw agent 的执行没有成功完成。
+
+常见原因：
+
+1) **目标 OpenClaw 实例没有配置 AI Provider**。
 
 ```bash
 openclaw config get auth.profiles
 ```
 
-确保至少配了一个认证 profile（如 `openai-codex`、`anthropic` 等）。
+2) **任务耗时过长导致调度超时**。
+
+解决：
+- 发送端使用异步 task 模式：`--non-blocking --wait`
+- 或提高插件超时：`plugins.entries.a2a-gateway.config.timeouts.agentResponseTimeoutMs`（默认 300000）
+
 
 ### Agent Card 返回 404
 

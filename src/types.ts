@@ -66,6 +66,13 @@ export interface GatewayConfig {
   routing: {
     defaultAgentId: string;
   };
+  timeouts?: {
+    /**
+     * Max time to wait for the underlying OpenClaw agent run to finish (Gateway RPC `agent`).
+     * Long-running prompts should use async task mode (blocking=false) + tasks/get polling.
+     */
+    agentResponseTimeoutMs?: number;
+  };
 }
 
 // ---------------------------------------------------------------------------

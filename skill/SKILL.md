@@ -147,6 +147,29 @@ node <WORKSPACE>/plugins/a2a-gateway/skill/scripts/a2a-send.mjs \
 
 The script uses `@a2a-js/sdk` ClientFactory to auto-discover the Agent Card, handle authentication, and print the peer agent's response.
 
+### Async task mode (recommended for long-running prompts)
+
+For prompts that may take longer than a typical request timeout (e.g., multi-round discussions, long summaries), use non-blocking mode + polling:
+
+```bash
+node <WORKSPACE>/plugins/a2a-gateway/skill/scripts/a2a-send.mjs \
+  --peer-url http://<PEER_IP>:18800 \
+  --token <PEER_TOKEN> \
+  --non-blocking \
+  --wait \
+  --timeout-ms 300000 \
+  --poll-ms 1000 \
+  --message "Discuss A2A advantages in 3 rounds and provide final conclusion"
+```
+
+This sends `configuration.blocking=false` and then polls `tasks/get` until the task reaches a terminal state.
+
+### Server-side timeout configuration (OpenClaw dispatch)
+
+If you still see `Request accepted (no agent dispatch available)`, the underlying OpenClaw agent run may be timing out. Increase:
+
+- `plugins.entries.a2a-gateway.config.timeouts.agentResponseTimeoutMs` (default: 300000)
+
 ### Optional: Route to a specific OpenClaw agentId (OpenClaw extension)
 
 By default, the peer will route inbound A2A messages to `routing.defaultAgentId`.
@@ -199,7 +222,7 @@ For two-way communication, repeat Steps 1-9 on BOTH servers:
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| "no agent dispatch available" | No AI provider configured | Run `openclaw config get auth.profiles` and set up a provider |
+| "no agent dispatch available" | (1) No AI provider configured, or (2) OpenClaw agent dispatch timed out | Check `openclaw config get auth.profiles`; for long prompts use async mode (`--non-blocking --wait`) or increase `config.timeouts.agentResponseTimeoutMs` |
 | "plugin not found: a2a-gateway" | Load path missing or wrong | Verify `plugins.load.paths` uses absolute path |
 | Agent Card 404 | Plugin not loaded | Check `plugins.allow` includes `a2a-gateway` |
 | Port 18800 connection refused | Gateway not restarted | Run `openclaw gateway restart` |

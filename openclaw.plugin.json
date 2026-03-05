@@ -87,6 +87,17 @@
             "default": "default"
           }
         }
+      },
+      "timeouts": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "agentResponseTimeoutMs": {
+            "type": "number",
+            "default": 300000,
+            "minimum": 1000
+          }
+        }
       }
     },
     "required": ["agentCard"]
