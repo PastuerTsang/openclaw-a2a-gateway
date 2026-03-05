@@ -138,30 +138,6 @@ cd <WORKSPACE>/plugins/a2a-gateway && npm ls @a2a-js/sdk
 
 ## Step 10: End-to-End Test
 
-### Method A: curl
-
-```bash
-curl -s -X POST http://<PEER_IP>:18800/a2a/jsonrpc \
-  -H "Authorization: Bearer <PEER_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "method": "message/send",
-    "params": {
-      "message": {
-        "messageId": "test-'$(date +%s)'",
-        "role": "user",
-        "parts": [{"kind": "text", "text": "Hello, what is your name?"}]
-      }
-    },
-    "id": "1"
-  }'
-```
-
-The response should contain the peer agent's reply at `result.status.message.parts[0].text`.
-
-### Method B: SDK script (recommended)
-
 ```bash
 node <WORKSPACE>/plugins/a2a-gateway/skill/scripts/a2a-send.mjs \
   --peer-url http://<PEER_IP>:18800 \
@@ -169,7 +145,7 @@ node <WORKSPACE>/plugins/a2a-gateway/skill/scripts/a2a-send.mjs \
   --message "Hello, what is your name?"
 ```
 
-The script uses `@a2a-js/sdk` ClientFactory with auto agent card discovery and transport selection.
+The script uses `@a2a-js/sdk` ClientFactory to auto-discover the Agent Card, handle authentication, and print the peer agent's response.
 
 ## Network: Tailscale Setup (if needed)
 
