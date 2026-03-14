@@ -155,7 +155,10 @@ function mergeSections(
 }
 
 function sectionsToString(sections: MemorySection[]): string {
-  return sections
+  // Sort sections chronologically by header to ensure deterministic output
+  // regardless of which side initiates the merge.
+  const sorted = [...sections].sort((a, b) => a.header.localeCompare(b.header));
+  return sorted
     .map((s) => [s.header, ...s.body].join("\n"))
     .join("\n\n")
     + "\n";
