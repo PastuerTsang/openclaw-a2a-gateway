@@ -501,6 +501,15 @@ const plugin = {
         });
         res.json(result);
       });
+
+      app.post("/a2a/learning-sync/sync", (req, res) => {
+        if (!lsAuthCheck(req, res)) return;
+        doLearningSync().then((results) => {
+          res.json({ ok: true, results });
+        }).catch((err) => {
+          res.status(500).json({ ok: false, error: String(err) });
+        });
+      });
     }
 
     if (config.observability.exposeMetricsEndpoint) {
