@@ -1,0 +1,37 @@
+{
+  "kind": "task",
+  "id": "7d9bcbda-57dc-41dc-b99d-5610f1e7fc6f",
+  "contextId": "e012fb63-0f92-49ba-8010-e997f7ac5aaa",
+  "status": {
+    "state": "failed",
+    "message": {
+      "kind": "message",
+      "messageId": "8b424b1e-0b7c-4f67-be7f-76e2ce0830ba",
+      "role": "agent",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "File validation failed: MIME type rejected: \"application/x-executable\""
+        }
+      ],
+      "contextId": "e012fb63-0f92-49ba-8010-e997f7ac5aaa"
+    },
+    "timestamp": "2026-03-13T23:32:11.966Z"
+  },
+  "history": [
+    {
+      "messageId": "15561719-7bb2-483d-bd9d-38aa667412c8",
+      "role": "user",
+      "parts": [
+        {
+          "kind": "file",
+          "file": {
+            "uri": "https://cdn.example.com/malware.exe",
+            "mimeType": "application/x-executable",
+            "name": "malware.exe"
+          }
+        }
+      ]
+    }
+  ]
+}

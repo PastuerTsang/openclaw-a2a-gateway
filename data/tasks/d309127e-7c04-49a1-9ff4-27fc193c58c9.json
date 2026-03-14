@@ -1,0 +1,41 @@
+{
+  "kind": "task",
+  "id": "d309127e-7c04-49a1-9ff4-27fc193c58c9",
+  "contextId": "ed3abb81-a9de-4609-b8e8-ae850c7ae04b",
+  "status": {
+    "state": "failed",
+    "message": {
+      "kind": "message",
+      "messageId": "0a05089e-9692-4ab2-8763-a9d93c90cc61",
+      "role": "agent",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "File validation failed: URI blocked: file:///etc/passwd — Blocked scheme: file"
+        }
+      ],
+      "contextId": "ed3abb81-a9de-4609-b8e8-ae850c7ae04b"
+    },
+    "timestamp": "2026-03-13T23:32:11.454Z"
+  },
+  "history": [
+    {
+      "messageId": "6df90dab-b52c-4564-a1ea-6665833a33ee",
+      "role": "user",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "Read this"
+        },
+        {
+          "kind": "file",
+          "file": {
+            "uri": "file:///etc/passwd",
+            "mimeType": "text/plain",
+            "name": "passwd"
+          }
+        }
+      ]
+    }
+  ]
+}

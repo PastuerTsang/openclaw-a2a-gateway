@@ -40,10 +40,57 @@ interface AgentResponse {
   mediaUrls: string[];
 }
 
-function pickAgentId(requestContext: RequestContext, fallbackAgentId: string): string {
+/**
+ * Extract a route key from the inbound A2A message.
+ * Looks for: explicit routeKey field, tags array, or message type metadata.
+ */
+function extractRouteKey(message: unknown): string | undefined {
+  const msg = asObject(message);
+  if (!msg) return undefined;
+
+  // Explicit routeKey field (OpenClaw extension)
+  if (typeof msg.routeKey === "string" && msg.routeKey.trim()) {
+    return msg.routeKey.trim();
+  }
+
+  // First tag in tags array
+  if (Array.isArray(msg.tags) && msg.tags.length > 0) {
+    const first = msg.tags[0];
+    if (typeof first === "string" && first.trim()) {
+      return first.trim();
+    }
+  }
+
+  // Metadata.routeKey
+  const meta = asObject(msg.metadata);
+  if (meta && typeof meta.routeKey === "string" && meta.routeKey.trim()) {
+    return meta.routeKey.trim();
+  }
+
+  return undefined;
+}
+
+function pickAgentId(
+  requestContext: RequestContext,
+  fallbackAgentId: string,
+  routingRules?: Array<{ routeKey: string; agentId: string; peer?: string }>,
+): string {
   const msg = requestContext.userMessage as unknown as Record<string, unknown> | undefined;
   const explicit = msg && typeof msg.agentId === "string" ? msg.agentId : "";
-  return explicit || fallbackAgentId;
+  if (explicit) return explicit;
+
+  // Try rule-based routing via route key
+  if (routingRules && routingRules.length > 0) {
+    const routeKey = extractRouteKey(requestContext.userMessage);
+    if (routeKey) {
+      const rule = routingRules.find((r) => r.routeKey === routeKey);
+      if (rule) {
+        return rule.agentId;
+      }
+    }
+  }
+
+  return fallbackAgentId;
 }
 
 function asObject(value: unknown): Record<string, unknown> | null {
@@ -274,8 +321,61 @@ function extractAgentResponse(payload: unknown): AgentResponse | undefined {
 }
 
 /**
+ * Extract URLs embedded in plain text (markdown links and bare URLs).
+ * Returns unique URLs not already present in the known set.
+ */
+function extractUrlsFromText(text: string, knownUrls: Set<string>): string[] {
+  const urls: string[] = [];
+  const seen = new Set(knownUrls);
+
+  // Match markdown links: [text](url)
+  const markdownLinkRe = /\[(?:[^\]]*)\]\((https?:\/\/[^)\s]+)\)/g;
+  let match: RegExpExecArray | null;
+  while ((match = markdownLinkRe.exec(text)) !== null) {
+    const url = match[1];
+    if (!seen.has(url)) {
+      seen.add(url);
+      urls.push(url);
+    }
+  }
+
+  // Match bare URLs (not already captured as markdown link targets)
+  const bareUrlRe = /(?<![(\[])https?:\/\/[^\s<>"')\]]+/g;
+  while ((match = bareUrlRe.exec(text)) !== null) {
+    let url = match[0];
+    // Strip trailing punctuation that's likely not part of the URL
+    url = url.replace(/[.,;:!?]+$/, "");
+    if (!seen.has(url)) {
+      seen.add(url);
+      urls.push(url);
+    }
+  }
+
+  return urls;
+}
+
+/** Simple check if a URL likely points to a file (has a file extension). */
+function looksLikeFileUrl(url: string): boolean {
+  try {
+    const pathname = new URL(url).pathname;
+    const ext = pathname.split(".").pop()?.toLowerCase() || "";
+    const fileExtensions = new Set([
+      "jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "ico",
+      "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+      "mp3", "wav", "ogg", "mp4", "webm", "avi", "mov",
+      "zip", "gz", "tar", "rar", "7z",
+      "csv", "json", "xml", "txt",
+    ]);
+    return fileExtensions.has(ext);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Build A2A Part array from an AgentResponse. Produces TextPart for text
  * content and FilePart entries for each media URL.
+ * Also extracts URLs from text that look like file references.
  */
 function buildResponseParts(response: AgentResponse): Part[] {
   const parts: Part[] = [];
@@ -284,11 +384,26 @@ function buildResponseParts(response: AgentResponse): Part[] {
     parts.push({ kind: "text", text: response.text });
   }
 
+  // Collect known media URLs
+  const knownUrls = new Set(response.mediaUrls);
   for (const url of response.mediaUrls) {
     parts.push({
       kind: "file",
       file: { uri: url },
     });
+  }
+
+  // Extract additional file URLs from response text
+  if (response.text) {
+    const extractedUrls = extractUrlsFromText(response.text, knownUrls);
+    for (const url of extractedUrls) {
+      if (looksLikeFileUrl(url)) {
+        parts.push({
+          kind: "file",
+          file: { uri: url },
+        });
+      }
+    }
   }
 
   // Ensure at least one part exists (A2A requires non-empty parts array)
@@ -701,6 +816,7 @@ class GatewayRpcConnection {
 export class OpenClawAgentExecutor implements AgentExecutor {
   private readonly api: OpenClawPluginApi;
   private readonly defaultAgentId: string;
+  private readonly routingRules: GatewayConfig["routing"]["rules"];
   private readonly agentResponseTimeoutMs: number;
   private readonly security: GatewayConfig["security"];
   private readonly taskContextByTaskId: Map<string, string>;
@@ -708,6 +824,7 @@ export class OpenClawAgentExecutor implements AgentExecutor {
   constructor(api: OpenClawPluginApi, config: GatewayConfig) {
     this.api = api;
     this.defaultAgentId = config.routing.defaultAgentId;
+    this.routingRules = config.routing.rules || [];
     this.security = config.security;
 
     const configured = config.timeouts?.agentResponseTimeoutMs;
@@ -720,7 +837,7 @@ export class OpenClawAgentExecutor implements AgentExecutor {
   }
 
   async execute(requestContext: RequestContext, eventBus: ExecutionEventBus): Promise<void> {
-    const agentId = pickAgentId(requestContext, this.defaultAgentId);
+    const agentId = pickAgentId(requestContext, this.defaultAgentId, this.routingRules);
     const taskId = requestContext.taskId;
     const contextId = requestContext.contextId;
     this.rememberTaskContext(taskId, contextId);

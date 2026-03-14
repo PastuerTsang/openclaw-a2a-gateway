@@ -1,0 +1,64 @@
+{
+  "kind": "task",
+  "id": "c00f8013-4a60-4db3-af4a-2639ebe4beb8",
+  "contextId": "4fb8e934-927c-4216-9e27-46b5f37bf3ee",
+  "status": {
+    "state": "completed",
+    "message": {
+      "kind": "message",
+      "messageId": "1737472b-e1a8-4cdc-a4a1-a65c75bd8458",
+      "role": "agent",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "Here is the generated image"
+        },
+        {
+          "kind": "file",
+          "file": {
+            "uri": "https://cdn.example.com/generated-chart.png"
+          }
+        }
+      ],
+      "contextId": "4fb8e934-927c-4216-9e27-46b5f37bf3ee"
+    },
+    "timestamp": "2026-03-13T23:32:10.930Z"
+  },
+  "history": [
+    {
+      "messageId": "9d8a033c-4ce2-4c42-ba0e-34c3141a3d03",
+      "role": "user",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "Analyze this image"
+        },
+        {
+          "kind": "file",
+          "file": {
+            "uri": "https://user-uploads.example.com/photo.jpg",
+            "mimeType": "image/jpeg",
+            "name": "photo.jpg"
+          }
+        }
+      ]
+    }
+  ],
+  "artifacts": [
+    {
+      "artifactId": "813234c4-3de8-4ddf-b474-e84334a668b4",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "Here is the generated image"
+        },
+        {
+          "kind": "file",
+          "file": {
+            "uri": "https://cdn.example.com/generated-chart.png"
+          }
+        }
+      ]
+    }
+  ]
+}

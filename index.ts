@@ -29,11 +29,15 @@ import type {
   InboundAuth,
   OpenClawPluginApi,
   PeerConfig,
+  RoutingRuleConfig,
 } from "./src/types.js";
 import {
   validateUri,
   validateMimeType,
 } from "./src/file-security.js";
+import { AuditLogger } from "./src/audit.js";
+import { PeerHealthTracker, withRetry } from "./src/peer-health.js";
+import { PushNotificationManager } from "./src/push-notifications.js";
 
 /** Build a JSON-RPC error response. */
 function jsonRpcError(id: string | number | null, code: number, message: string) {
@@ -137,6 +141,23 @@ function parsePeers(raw: unknown): PeerConfig[] {
   return peers;
 }
 
+function parseRoutingRules(raw: unknown): RoutingRuleConfig[] {
+  if (!Array.isArray(raw)) return [];
+  const rules: RoutingRuleConfig[] = [];
+  for (const entry of raw) {
+    const value = asObject(entry);
+    const routeKey = asString(value.routeKey, "");
+    const agentId = asString(value.agentId, "");
+    if (!routeKey || !agentId) continue;
+    rules.push({
+      routeKey,
+      agentId,
+      peer: asString(value.peer, "") || undefined,
+    });
+  }
+  return rules;
+}
+
 function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): GatewayConfig {
   const config = asObject(raw);
   const server = asObject(config.server);
@@ -146,6 +167,8 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
   const limits = asObject(config.limits);
   const observability = asObject(config.observability);
   const timeouts = asObject(config.timeouts);
+  const resilience = asObject(config.resilience);
+  const pushNotifications = asObject(config.pushNotifications);
 
   const inboundAuth = asString(security.inboundAuth, "none") as InboundAuth;
 
@@ -160,6 +183,10 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
   const rawUriAllowlist = Array.isArray(security.fileUriAllowlist) ? security.fileUriAllowlist : [];
   const fileUriAllowlist = rawUriAllowlist.filter((v: unknown) => typeof v === "string") as string[];
 
+  // Token rotation: accept both singular token and tokens array
+  const rawTokens = Array.isArray(security.tokens) ? security.tokens : [];
+  const tokens = rawTokens.filter((v: unknown) => typeof v === "string" && v.trim()) as string[];
+
   return {
     agentCard: parseAgentCard(asObject(config.agentCard)),
     server: {
@@ -170,11 +197,13 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
       tasksDir: resolveConfiguredPath(storage.tasksDir, "data/tasks", resolvePath),
       taskTtlHours: Math.max(1, asNumber(storage.taskTtlHours, 72)),
       cleanupIntervalMinutes: Math.max(1, asNumber(storage.cleanupIntervalMinutes, 60)),
+      auditDir: resolveConfiguredPath(storage.auditDir, "data/audit", resolvePath),
     },
     peers: parsePeers(config.peers),
     security: {
       inboundAuth: inboundAuth === "bearer" ? "bearer" : "none",
       token: asString(security.token, ""),
+      tokens,
       allowedMimeTypes,
       maxFileSizeBytes: asNumber(security.maxFileSizeBytes, 52_428_800),
       maxInlineFileSizeBytes: asNumber(security.maxInlineFileSizeBytes, 10_485_760),
@@ -182,6 +211,7 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
     },
     routing: {
       defaultAgentId: asString(routing.defaultAgentId, "default"),
+      rules: parseRoutingRules(routing.rules),
     },
     limits: {
       maxConcurrentTasks: Math.max(1, Math.floor(asNumber(limits.maxConcurrentTasks, 4))),
@@ -194,6 +224,17 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
     },
     timeouts: {
       agentResponseTimeoutMs: asNumber(timeouts.agentResponseTimeoutMs, 300_000),
+    },
+    resilience: {
+      healthCheckIntervalSeconds: Math.max(10, asNumber(resilience.healthCheckIntervalSeconds, 60)),
+      circuitBreakerThreshold: Math.max(1, asNumber(resilience.circuitBreakerThreshold, 5)),
+      circuitBreakerCooldownSeconds: Math.max(5, asNumber(resilience.circuitBreakerCooldownSeconds, 30)),
+      maxRetries: Math.max(0, asNumber(resilience.maxRetries, 3)),
+    },
+    pushNotifications: {
+      enabled: asBoolean(pushNotifications.enabled, false),
+      maxCallbacksPerTask: Math.max(1, asNumber(pushNotifications.maxCallbacksPerTask, 5)),
+      maxDeliveryRetries: Math.max(0, asNumber(pushNotifications.maxDeliveryRetries, 3)),
     },
   };
 }
@@ -218,6 +259,21 @@ const plugin = {
     });
     const client = new A2AClient();
     const taskStore = new FileTaskStore(config.storage.tasksDir);
+    const audit = new AuditLogger(config.storage.auditDir);
+    const peerHealth = new PeerHealthTracker(config.peers, config.resilience, api.logger);
+    const pushManager = new PushNotificationManager(
+      config.pushNotifications,
+      api.logger,
+      (taskId, url, ok) => {
+        void audit.record({
+          ts: new Date().toISOString(),
+          action: "push_notification",
+          taskId,
+          ok,
+          detail: `url=${url}`,
+        });
+      },
+    );
     const executor = new QueueingAgentExecutor(
       new OpenClawAgentExecutor(api, config),
       telemetry,
@@ -225,15 +281,40 @@ const plugin = {
     );
     const agentCard = buildAgentCard(config);
 
+    // Build the set of accepted bearer tokens (supports rotation)
+    const acceptedTokens = new Set<string>();
+    if (config.security.token) {
+      acceptedTokens.add(config.security.token);
+    }
+    if (config.security.tokens) {
+      for (const t of config.security.tokens) {
+        if (t) acceptedTokens.add(t);
+      }
+    }
+
+    // Validate a bearer token against all accepted tokens
+    const validateBearerToken = (header: string | undefined): boolean => {
+      if (!header) return false;
+      const prefix = "Bearer ";
+      if (!header.startsWith(prefix)) return false;
+      return acceptedTokens.has(header.slice(prefix.length));
+    };
+
     // SDK expects userBuilder(req) -> Promise<User>
     // When bearer auth is configured, validate the Authorization header.
+    // Supports token rotation: accepts any token from `token` + `tokens` array.
     const userBuilder = async (req: { headers?: Record<string, string | string[] | undefined> }) => {
-      if (config.security.inboundAuth === "bearer" && config.security.token) {
+      if (config.security.inboundAuth === "bearer" && acceptedTokens.size > 0) {
         const authHeader = req.headers?.authorization;
         const header = Array.isArray(authHeader) ? authHeader[0] : authHeader;
-        const expected = `Bearer ${config.security.token}`;
-        if (!header || header !== expected) {
+        if (!validateBearerToken(header)) {
           telemetry.recordSecurityRejection("http", "invalid or missing bearer token");
+          void audit.record({
+            ts: new Date().toISOString(),
+            action: "auth_rejected",
+            method: "http",
+            detail: "invalid or missing bearer token",
+          });
           throw jsonRpcError(null, -32000, "Unauthorized: invalid or missing bearer token");
         }
       }
@@ -298,11 +379,65 @@ const plugin = {
       })
     );
 
+    // Push notification endpoints (A2A spec compliant)
+    if (config.pushNotifications.enabled) {
+      app.post("/a2a/push/register", express.json(), async (req, res) => {
+        // Auth check
+        if (config.security.inboundAuth === "bearer" && acceptedTokens.size > 0) {
+          if (!validateBearerToken(req.headers.authorization)) {
+            res.status(401).json({ error: "Unauthorized" });
+            return;
+          }
+        }
+        const body = req.body || {};
+        const taskId = typeof body.taskId === "string" ? body.taskId : "";
+        const url = typeof body.url === "string" ? body.url : "";
+        const token = typeof body.token === "string" ? body.token : undefined;
+        if (!taskId || !url) {
+          res.status(400).json({ error: "taskId and url are required" });
+          return;
+        }
+        const result = pushManager.register(taskId, url, token);
+        if (result.ok) {
+          res.json({ registered: true });
+        } else {
+          res.status(400).json({ error: result.reason });
+        }
+      });
+
+      app.post("/a2a/push/unregister", express.json(), async (req, res) => {
+        if (config.security.inboundAuth === "bearer" && acceptedTokens.size > 0) {
+          if (!validateBearerToken(req.headers.authorization)) {
+            res.status(401).json({ error: "Unauthorized" });
+            return;
+          }
+        }
+        const body = req.body || {};
+        const taskId = typeof body.taskId === "string" ? body.taskId : "";
+        const url = typeof body.url === "string" ? body.url : "";
+        if (!taskId || !url) {
+          res.status(400).json({ error: "taskId and url are required" });
+          return;
+        }
+        const removed = pushManager.unregister(taskId, url);
+        res.json({ removed });
+      });
+    }
+
     if (config.observability.exposeMetricsEndpoint) {
       app.get(
         config.observability.metricsPath,
         createHttpMetricsMiddleware("metrics"),
-        (_req, res) => {
+        (req, res) => {
+          // Protect metrics endpoint with bearer auth when configured
+          if (config.security.inboundAuth === "bearer" && acceptedTokens.size > 0) {
+            const authHeader = req.headers.authorization;
+            if (!validateBearerToken(authHeader)) {
+              telemetry.recordSecurityRejection("http", "metrics endpoint auth failed");
+              res.status(401).json({ error: "Unauthorized" });
+              return;
+            }
+          }
           res.json(telemetry.snapshot());
         },
       );
@@ -319,6 +454,38 @@ const plugin = {
       });
     });
 
+    api.registerGatewayMethod("a2a.peers", ({ respond }) => {
+      respond(true, {
+        peers: peerHealth.snapshot(),
+      });
+    });
+
+    // Push notification management
+    api.registerGatewayMethod("a2a.pushNotifications.register", ({ params, respond }) => {
+      const payload = asObject(params);
+      const taskId = asString(payload.taskId, "");
+      const url = asString(payload.url, "");
+      const token = asString(payload.token, "") || undefined;
+      if (!taskId || !url) {
+        respond(false, { error: "taskId and url are required" });
+        return;
+      }
+      const result = pushManager.register(taskId, url, token);
+      respond(result.ok, result.ok ? { registered: true } : { error: result.reason });
+    });
+
+    api.registerGatewayMethod("a2a.pushNotifications.unregister", ({ params, respond }) => {
+      const payload = asObject(params);
+      const taskId = asString(payload.taskId, "");
+      const url = asString(payload.url, "");
+      if (!taskId || !url) {
+        respond(false, { error: "taskId and url are required" });
+        return;
+      }
+      const removed = pushManager.unregister(taskId, url);
+      respond(true, { removed });
+    });
+
     api.registerGatewayMethod("a2a.send", ({ params, respond }) => {
       const payload = asObject(params);
       const peerName = asString(payload.peer || payload.name, "");
@@ -330,32 +497,71 @@ const plugin = {
         return;
       }
 
-      const startedAt = Date.now();
-      client
-        .sendMessage(peer, message)
-        .then((result) => {
-          telemetry.recordOutboundRequest(
-            peer.name,
-            result.ok,
-            result.statusCode,
-            Date.now() - startedAt,
-          );
-          if (result.ok) {
-            respond(true, {
-              statusCode: result.statusCode,
-              response: result.response,
-            });
-            return;
-          }
+      // Circuit breaker check
+      if (!peerHealth.isAvailable(peer.name)) {
+        void audit.record({
+          ts: new Date().toISOString(),
+          action: "outbound",
+          peer: peer.name,
+          method: "a2a.send",
+          ok: false,
+          detail: "circuit breaker open",
+        });
+        respond(false, { error: `Peer "${peer.name}" is unavailable (circuit breaker open)` });
+        return;
+      }
 
-          respond(false, {
+      const startedAt = Date.now();
+      withRetry(() => client.sendMessage(peer, message).then((result) => {
+        if (!result.ok) {
+          throw Object.assign(new Error(`Peer returned ${result.statusCode}`), { result });
+        }
+        return result;
+      }), config.resilience.maxRetries)
+        .then((result) => {
+          const durationMs = Date.now() - startedAt;
+          peerHealth.recordSuccess(peer.name);
+          telemetry.recordOutboundRequest(peer.name, true, result.statusCode, durationMs);
+          void audit.record({
+            ts: new Date().toISOString(),
+            action: "outbound",
+            peer: peer.name,
+            method: "a2a.send",
+            ok: true,
+            statusCode: result.statusCode,
+            durationMs,
+          });
+          respond(true, {
             statusCode: result.statusCode,
             response: result.response,
           });
         })
         .catch((error) => {
-          telemetry.recordOutboundRequest(peer.name, false, 500, Date.now() - startedAt);
-          respond(false, { error: String(error?.message || error) });
+          const durationMs = Date.now() - startedAt;
+          peerHealth.recordFailure(peer.name);
+
+          // Extract status from enriched error if available
+          const enrichedResult = (error as any)?.result;
+          const statusCode = enrichedResult?.statusCode || 500;
+          const response = enrichedResult?.response;
+
+          telemetry.recordOutboundRequest(peer.name, false, statusCode, durationMs);
+          void audit.record({
+            ts: new Date().toISOString(),
+            action: "outbound",
+            peer: peer.name,
+            method: "a2a.send",
+            ok: false,
+            statusCode,
+            durationMs,
+            detail: String(error?.message || error),
+          });
+
+          if (response) {
+            respond(false, { statusCode, response });
+          } else {
+            respond(false, { error: String(error?.message || error) });
+          }
         });
     });
 
@@ -428,6 +634,14 @@ const plugin = {
               message.agentId = params.agentId;
             }
             const result = await client.sendMessage(peer, message);
+            void audit.record({
+              ts: new Date().toISOString(),
+              action: "file_send",
+              peer: params.peer,
+              ok: result.ok,
+              statusCode: result.statusCode,
+              detail: `uri=${params.uri}`,
+            });
             if (result.ok) {
               return {
                 content: [{ type: "text" as const, text: `File sent to ${params.peer} via A2A.\nURI: ${params.uri}\nResponse: ${JSON.stringify(result.response)}` }],
@@ -440,6 +654,13 @@ const plugin = {
             };
           } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
+            void audit.record({
+              ts: new Date().toISOString(),
+              action: "file_send",
+              peer: params.peer,
+              ok: false,
+              detail: `uri=${params.uri} error=${msg}`,
+            });
             return {
               content: [{ type: "text" as const, text: `Error sending file to ${params.peer}: ${msg}` }],
               details: { ok: false, error: msg },
@@ -482,13 +703,18 @@ const plugin = {
           const grpcUserBuilder = async (
             call: { metadata?: { get: (key: string) => unknown[] } } | unknown,
           ) => {
-            if (config.security.inboundAuth === "bearer" && config.security.token) {
+            if (config.security.inboundAuth === "bearer" && acceptedTokens.size > 0) {
               const meta = (call as any)?.metadata;
               const values = meta?.get?.("authorization") || meta?.get?.("Authorization") || [];
               const header = Array.isArray(values) && values.length > 0 ? String(values[0]) : "";
-              const expected = `Bearer ${config.security.token}`;
-              if (!header || header !== expected) {
+              if (!validateBearerToken(header)) {
                 telemetry.recordSecurityRejection("grpc", "invalid or missing bearer token");
+                void audit.record({
+                  ts: new Date().toISOString(),
+                  action: "auth_rejected",
+                  method: "grpc",
+                  detail: "invalid or missing bearer token",
+                });
                 const err: any = new Error("Unauthorized: invalid or missing bearer token");
                 err.code = GrpcStatus.UNAUTHENTICATED;
                 throw err;
@@ -546,8 +772,19 @@ const plugin = {
         api.logger.info(
           `a2a-gateway: task cleanup enabled — ttl=${config.storage.taskTtlHours}h interval=${config.storage.cleanupIntervalMinutes}min`,
         );
+
+        // Start peer health checks
+        if (config.peers.length > 0) {
+          peerHealth.start();
+          api.logger.info(
+            `a2a-gateway: peer health checks enabled — interval=${config.resilience.healthCheckIntervalSeconds}s threshold=${config.resilience.circuitBreakerThreshold} cooldown=${config.resilience.circuitBreakerCooldownSeconds}s`,
+          );
+        }
       },
       async stop(_ctx) {
+        // Stop peer health checks
+        peerHealth.stop();
+
         // Stop task cleanup timer
         if (cleanupTimer) {
           clearInterval(cleanupTimer);

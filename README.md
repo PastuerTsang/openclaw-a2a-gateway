@@ -555,11 +555,11 @@ The agent will follow the skill's procedure automatically.
 
 Production-grade async task mode:
 
-- ~~Persist tasks to disk (replace `InMemoryTaskStore` with a durable store) so `tasks/get` survives gateway restarts~~ ✅ Done (PR #14)
-- Provide a streaming-first path (SSE / sendMessageStream) for incremental outputs
-- Push notifications support (store + sender) for long-running tasks
-- ~~Concurrency limits / queueing for inbound A2A dispatch to protect the OpenClaw gateway~~ ✅ Done (PR #14)
-- ~~Observability: structured logs + metrics for task durations/timeouts~~ ✅ Done (PR #14)
+- ~~Persist tasks to disk (replace `InMemoryTaskStore` with a durable store)~~ ✅ Done — `FileTaskStore` with atomic writes
+- ~~Provide a streaming-first path (SSE / sendMessageStream)~~ ✅ Done — P4 SSE streaming with heartbeat
+- ~~Push notifications support (store + sender)~~ ✅ Done — `PushNotificationManager` with webhook callbacks, register/unregister, retry with backoff
+- ~~Concurrency limits / queueing~~ ✅ Done — `QueueingAgentExecutor` with configurable concurrency + queue
+- ~~Observability: structured logs + metrics~~ ✅ Done — `GatewayTelemetry` structured JSON logs + `/a2a/metrics`
 
 Multi-round conversation:
 
@@ -567,31 +567,31 @@ Multi-round conversation:
 
 Security & auth hardening:
 
-- ~~SSRF protections + allowlists for any URI fetching (needed for file parts)~~ ✅ Done (PR #16)
+- ~~SSRF protections + allowlists for any URI fetching~~ ✅ Done (PR #16)
 - ~~File size limits + MIME allowlist + content sniffing~~ ✅ Done (PR #16)
-- Token rotation / keyring (accept multiple tokens during rotation window)
-- Audit log for inbound/outbound A2A calls (who/when/peer/taskId)
-- Task file TTL / cleanup (FileTaskStore files never expire)
-- Metrics endpoint authentication (currently unauthenticated)
+- ~~Token rotation / keyring (accept multiple tokens during rotation window)~~ ✅ Done — `security.tokens[]` array for zero-downtime rotation
+- ~~Audit log for inbound/outbound A2A calls (who/when/peer/taskId)~~ ✅ Done — `AuditLogger` daily JSONL audit files
+- ~~Task file TTL / cleanup~~ ✅ Done — configurable `taskTtlHours` + automatic cleanup
+- ~~Metrics endpoint authentication~~ ✅ Done — `/a2a/metrics` now requires bearer token when auth is enabled
 
 Interoperability & transport resilience:
 
-- Peer health checks + retry/backoff + circuit breaker (per-peer)
+- ~~Peer health checks + retry/backoff + circuit breaker (per-peer)~~ ✅ Done — `PeerHealthTracker` periodic probing + 3-state circuit breaker + `withRetry` exponential backoff
 - Automatic transport fallback (prefer JSON-RPC by default; fall back between JSON-RPC/REST/GRPC based on failures)
 - Cross-implementation compatibility test matrix (ensure interop with other A2A servers/clients)
 
 Routing & orchestration:
 
-- Rule-based routing: choose peer + target OpenClaw agentId based on message type/tags
+- ~~Rule-based routing: choose peer + target OpenClaw agentId based on message type/tags~~ ✅ Done — `routing.rules[]` config + routeKey/tags extraction from messages
 
 File / image transfer enhancements:
 
 - ~~Support A2A `file` parts end-to-end (URI + optional bytes/base64)~~ ✅ Done
 - ~~Support A2A `data` parts (structured JSON)~~ ✅ Done
 - ~~Agent tool `a2a_send_file` for programmatic file sending~~ ✅ Done
-- ~~Extend `a2a-send.mjs` with `--file-uri` / `--file-path` to send `kind:"file"` parts from CLI~~ ✅ Done (PR #16)
-- Extract URLs from agent text responses (markdown links, bare URLs) into outbound FileParts
-- ~~Plugin-side handling: fetch URI to a temp file (or pass URI through) and dispatch to the target OpenClaw agent with a safe reference~~ (handled via text serialization, PR #16)
+- ~~Extend `a2a-send.mjs` with `--file-uri` / `--file-path`~~ ✅ Done (PR #16)
+- ~~Extract URLs from agent text responses (markdown links, bare URLs) into outbound FileParts~~ ✅ Done — auto-extracts file-extension URLs to FilePart
+- ~~Plugin-side handling: fetch URI to a temp file (or pass URI through)~~ (handled via text serialization, PR #16)
 - ~~Security: size limits, mime allowlist, SSRF protections for URI fetches, and redaction of bytes in logs~~ ✅ Done (PR #16)
 
 ## License

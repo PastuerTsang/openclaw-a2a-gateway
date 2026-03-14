@@ -64,6 +64,11 @@
             "default": 60,
             "minimum": 1,
             "description": "Minutes between automatic task cleanup runs (default 60min)"
+          },
+          "auditDir": {
+            "type": "string",
+            "default": "data/audit",
+            "description": "Directory for append-only audit log files"
           }
         }
       },
@@ -101,6 +106,11 @@
             "default": "none"
           },
           "token": { "type": "string" },
+          "tokens": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Additional bearer tokens accepted during rotation windows. All tokens in this array plus the primary 'token' are valid simultaneously."
+          },
           "allowedMimeTypes": {
             "type": "array",
             "items": { "type": "string" },
@@ -132,6 +142,19 @@
           "defaultAgentId": {
             "type": "string",
             "default": "default"
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "routeKey": { "type": "string", "description": "Route key to match (e.g. message tag, type)" },
+                "agentId": { "type": "string", "description": "Target agentId to dispatch to" },
+                "peer": { "type": "string", "description": "Optional peer name — forward to this peer instead of local dispatch" }
+              },
+              "required": ["routeKey", "agentId"]
+            },
+            "description": "Rules for routing inbound messages by route key to specific agents or peers"
           }
         }
       },
@@ -179,6 +202,59 @@
             "minimum": 1000
           }
         }
+      },
+      "resilience": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "healthCheckIntervalSeconds": {
+            "type": "number",
+            "default": 60,
+            "minimum": 10,
+            "description": "Seconds between peer health checks (default 60)"
+          },
+          "circuitBreakerThreshold": {
+            "type": "number",
+            "default": 5,
+            "minimum": 1,
+            "description": "Consecutive failures before circuit opens (default 5)"
+          },
+          "circuitBreakerCooldownSeconds": {
+            "type": "number",
+            "default": 30,
+            "minimum": 5,
+            "description": "Seconds in open state before half-open probe (default 30)"
+          },
+          "maxRetries": {
+            "type": "number",
+            "default": 3,
+            "minimum": 0,
+            "description": "Max retry attempts for failed peer sends (default 3)"
+          }
+        }
+      },
+      "pushNotifications": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable A2A push notification support (webhook callbacks)"
+          },
+          "maxCallbacksPerTask": {
+            "type": "number",
+            "default": 5,
+            "minimum": 1,
+            "description": "Max push notification callbacks stored per task"
+          },
+          "maxDeliveryRetries": {
+            "type": "number",
+            "default": 3,
+            "minimum": 0,
+            "description": "Max retry attempts for webhook delivery"
+          }
+        }
       }
     }
   },
@@ -191,7 +267,8 @@
       }
     },
     "security": {
-      "token": { "sensitive": true }
+      "token": { "sensitive": true },
+      "tokens": { "items": { "sensitive": true } }
     }
   }
 }

@@ -66,6 +66,49 @@ export interface FileSecurityConfig {
 export interface SecurityConfig extends FileSecurityConfig {
   inboundAuth: InboundAuth;
   token?: string;
+  /** Additional tokens accepted during rotation windows. */
+  tokens?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Routing rule configuration
+// ---------------------------------------------------------------------------
+
+export interface RoutingRuleConfig {
+  /** Route key to match against inbound message metadata. */
+  routeKey: string;
+  /** Target agentId to dispatch to. */
+  agentId: string;
+  /** Optional peer name — when set, the message is forwarded to this peer instead of local dispatch. */
+  peer?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Peer health / resilience configuration
+// ---------------------------------------------------------------------------
+
+export interface PeerResilienceConfig {
+  /** Interval between health checks in seconds (default 60). */
+  healthCheckIntervalSeconds: number;
+  /** Number of consecutive failures before circuit opens (default 5). */
+  circuitBreakerThreshold: number;
+  /** Seconds to wait in open state before half-open probe (default 30). */
+  circuitBreakerCooldownSeconds: number;
+  /** Max retry attempts for failed sends (default 3). */
+  maxRetries: number;
+}
+
+// ---------------------------------------------------------------------------
+// Push notification configuration
+// ---------------------------------------------------------------------------
+
+export interface PushNotificationConfig {
+  /** Enable push notification support (default false). */
+  enabled: boolean;
+  /** Max callbacks stored per task (default 5). */
+  maxCallbacksPerTask: number;
+  /** Max retry attempts for webhook delivery (default 3). */
+  maxDeliveryRetries: number;
 }
 
 export interface GatewayConfig {
@@ -78,11 +121,15 @@ export interface GatewayConfig {
     tasksDir: string;
     taskTtlHours: number;
     cleanupIntervalMinutes: number;
+    /** Directory for audit log files (default "data/audit"). */
+    auditDir: string;
   };
   peers: PeerConfig[];
   security: SecurityConfig;
   routing: {
     defaultAgentId: string;
+    /** Routing rules for message-type/tag-based routing. */
+    rules: RoutingRuleConfig[];
   };
   limits: {
     maxConcurrentTasks: number;
@@ -100,6 +147,8 @@ export interface GatewayConfig {
      */
     agentResponseTimeoutMs?: number;
   };
+  resilience: PeerResilienceConfig;
+  pushNotifications: PushNotificationConfig;
 }
 
 // ---------------------------------------------------------------------------

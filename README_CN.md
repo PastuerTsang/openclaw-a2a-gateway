@@ -543,39 +543,40 @@ Agent 会自动按照 skill 的流程执行。
 
 生产级异步 task 模式（欢迎 PR）：
 
-- 将任务持久化到磁盘（替换 `InMemoryTaskStore`），使 `tasks/get` 在 gateway 重启后不丢
-- 提供更适合流式输出的路径（SSE / sendMessageStream）
-- Push notifications 支持（store + sender），用于超长任务的异步回调
-- 并发限制 / 队列：保护 OpenClaw gateway 不被大量入站 A2A 请求压垮
-- 可观测性：结构化日志 + 指标（任务耗时/超时/失败率）
+- ~~将任务持久化到磁盘（替换 `InMemoryTaskStore`）~~ ✅ 已完成 — `FileTaskStore` 原子写入
+- ~~提供更适合流式输出的路径（SSE / sendMessageStream）~~ ✅ 已完成 — P4 SSE streaming
+- ~~Push notifications 支持（store + sender）~~ ✅ 已完成 — `PushNotificationManager` webhook 回调，支持注册/注销/重试
+- ~~并发限制 / 队列~~ ✅ 已完成 — `QueueingAgentExecutor` 可配置并发 + 队列
+- ~~可观测性：结构化日志 + 指标~~ ✅ 已完成 — `GatewayTelemetry` 结构化 JSON 日志 + `/a2a/metrics`
 
 互操作与传输韧性（欢迎 PR）：
 
-- Peer 健康检查 + retry/backoff + 熔断（按 peer 维度）
+- ~~Peer 健康检查 + retry/backoff + 熔断~~ ✅ 已完成 — `PeerHealthTracker` 定期探测 + 三态熔断 + `withRetry` 指数退避
 - 自动传输降级（默认 JSON-RPC；在 JSON-RPC/REST/GRPC 之间按失败情况切换）
 - 跨实现兼容性测试矩阵（确保与其他 A2A server/client 互通）
 
 安全与鉴权增强（欢迎 PR）：
 
-- URI fetch 的 SSRF 防护 + allowlist（为 file parts 做准备）
-- 文件大小限制 + MIME allowlist + 内容嗅探
-- Token 轮换 / keyring（轮换窗口内同时接受多 token）
-- 入站/出站 A2A 调用审计日志（who/when/peer/taskId）
+- ~~URI fetch 的 SSRF 防护 + allowlist~~ ✅ 已完成 — `file-security.ts`
+- ~~文件大小限制 + MIME allowlist + 内容嗅探~~ ✅ 已完成
+- ~~Token 轮换 / keyring（轮换窗口内同时接受多 token）~~ ✅ 已完成 — `security.tokens[]` 支持多 token 同时有效
+- ~~入站/出站 A2A 调用审计日志（who/when/peer/taskId）~~ ✅ 已完成 — `AuditLogger` 每日 JSONL 审计文件
+- ~~Metrics 端点鉴权~~ ✅ 已完成 — `/a2a/metrics` 现在需要 bearer token
 
 路由与编排（欢迎 PR）：
 
-- 规则路由：按消息类型/标签自动选择 peer + 目标 OpenClaw agentId
-- 显式多轮对话支持（通过 taskId/contextId 传递上下文）
+- ~~规则路由：按消息类型/标签自动选择 peer + 目标 OpenClaw agentId~~ ✅ 已完成 — `routing.rules[]` 配置 + routeKey/tags 提取
+- ~~显式多轮对话支持（通过 taskId/contextId 传递上下文）~~ ✅ 已完成 — P1
 
 文件 / 图像传输增强（欢迎 PR）：
 
 - ~~端到端支持 A2A `file` parts（URI + 可选 bytes/base64）~~ ✅ 已完成
 - ~~支持 A2A `data` parts（结构化 JSON）~~ ✅ 已完成
 - ~~Agent 工具 `a2a_send_file`，编程式发送文件~~ ✅ 已完成
-- 扩展 `a2a-send.mjs`：增加 `--file-uri` / `--file-path`，从命令行发送 `kind:"file"` parts
-- 从 Agent 文本回复中提取 URL（markdown 链接、裸 URL）为出站 FilePart
+- ~~扩展 `a2a-send.mjs`：增加 `--file-uri` / `--file-path`~~ ✅ 已完成
+- ~~从 Agent 文本回复中提取 URL（markdown 链接、裸 URL）为出站 FilePart~~ ✅ 已完成 — 自动提取文件扩展名 URL 转 FilePart
 - 插件侧处理：下载 URI 到临时文件（或安全透传 URI），再以安全引用的方式交给目标 OpenClaw agent
-- 安全：大小限制、mime allowlist、URI fetch 的 SSRF 防护、以及日志中对 bytes 的脱敏/禁止输出
+- ~~安全：大小限制、mime allowlist、URI fetch 的 SSRF 防护、以及日志中对 bytes 的脱敏/禁止输出~~ ✅ 已完成
 
 ## 许可证
 

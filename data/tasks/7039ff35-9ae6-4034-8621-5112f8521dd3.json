@@ -1,0 +1,37 @@
+{
+  "kind": "task",
+  "id": "7039ff35-9ae6-4034-8621-5112f8521dd3",
+  "contextId": "bdb9a838-8393-47bf-9dac-311606b01601",
+  "status": {
+    "state": "failed",
+    "message": {
+      "kind": "message",
+      "messageId": "8e41ae22-63ae-4456-a8c0-11929fad7e91",
+      "role": "agent",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "File validation failed: Inline file too large: File size 0.0MB exceeds limit 0.0MB"
+        }
+      ],
+      "contextId": "bdb9a838-8393-47bf-9dac-311606b01601"
+    },
+    "timestamp": "2026-03-13T23:34:06.010Z"
+  },
+  "history": [
+    {
+      "messageId": "6f99455f-6d9d-4914-989e-dcd0d2a5755e",
+      "role": "user",
+      "parts": [
+        {
+          "kind": "file",
+          "file": {
+            "bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "mimeType": "image/png",
+            "name": "large.png"
+          }
+        }
+      ]
+    }
+  ]
+}
