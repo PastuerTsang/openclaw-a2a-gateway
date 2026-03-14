@@ -59,7 +59,8 @@ function hashContent(content: string): string {
 }
 
 function isMemoryFile(name: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}(\.summary)?\.md$/.test(name);
+  // Match: 2026-03-13.md, 2026-03-13.summary.md, 2026-03-08-0744.md, 2026-03-08-greeting-check.md
+  return /^\d{4}-\d{2}-\d{2}[\w.-]*\.md$/.test(name);
 }
 
 /** Parse a markdown memory file into sections (split on ## headers). */
