@@ -7,6 +7,7 @@
  */
 
 import type { Server } from "node:http";
+import os from "node:os";
 import path from "node:path";
 
 import { AGENT_CARD_PATH } from "@a2a-js/sdk";
@@ -27,10 +28,12 @@ import type {
   AgentCardConfig,
   GatewayConfig,
   InboundAuth,
+  LearningSyncGatewayConfig,
   OpenClawPluginApi,
   PeerConfig,
   RoutingRuleConfig,
 } from "./src/types.js";
+import { LearningSyncManager } from "./src/learning-sync.js";
 import {
   validateUri,
   validateMimeType,
@@ -169,6 +172,7 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
   const timeouts = asObject(config.timeouts);
   const resilience = asObject(config.resilience);
   const pushNotifications = asObject(config.pushNotifications);
+  const learningSync = asObject(config.learningSync);
 
   const inboundAuth = asString(security.inboundAuth, "none") as InboundAuth;
 
@@ -236,6 +240,16 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
       maxCallbacksPerTask: Math.max(1, asNumber(pushNotifications.maxCallbacksPerTask, 5)),
       maxDeliveryRetries: Math.max(0, asNumber(pushNotifications.maxDeliveryRetries, 3)),
     },
+    learningSync: {
+      enabled: asBoolean(learningSync.enabled, false),
+      memoryDir: resolveConfiguredPath(
+        learningSync.memoryDir,
+        path.join(process.env.OPENCLAW_HOME || path.join(process.env.HOME || "/root", ".openclaw"), "workspace", "memory"),
+        resolvePath,
+      ),
+      instanceName: asString(learningSync.instanceName, "") || os.hostname(),
+      autoSyncIntervalSeconds: Math.max(0, asNumber(learningSync.autoSyncIntervalSeconds, 300)),
+    },
   };
 }
 
@@ -274,6 +288,17 @@ const plugin = {
         });
       },
     );
+    const learningSyncMgr = config.learningSync.enabled
+      ? new LearningSyncManager(
+          {
+            memoryDir: config.learningSync.memoryDir,
+            instanceName: config.learningSync.instanceName,
+            autoSyncIntervalSeconds: config.learningSync.autoSyncIntervalSeconds,
+          },
+          api.logger,
+        )
+      : null;
+
     const executor = new QueueingAgentExecutor(
       new OpenClawAgentExecutor(api, config),
       telemetry,
@@ -424,6 +449,60 @@ const plugin = {
       });
     }
 
+    // Learning Sync HTTP endpoints
+    if (config.learningSync.enabled && learningSyncMgr) {
+      const lsAuthCheck = (req: express.Request, res: express.Response): boolean => {
+        if (config.security.inboundAuth === "bearer" && acceptedTokens.size > 0) {
+          if (!validateBearerToken(req.headers.authorization)) {
+            res.status(401).json({ error: "Unauthorized" });
+            return false;
+          }
+        }
+        return true;
+      };
+
+      app.get("/a2a/learning-sync/manifest", (req, res) => {
+        if (!lsAuthCheck(req, res)) return;
+        const manifest = learningSyncMgr.getManifest();
+        res.json({ instanceName: config.learningSync.instanceName, manifest });
+      });
+
+      app.post("/a2a/learning-sync/fetch", express.json(), (req, res) => {
+        if (!lsAuthCheck(req, res)) return;
+        const name = typeof req.body?.name === "string" ? req.body.name : "";
+        if (!name) {
+          res.status(400).json({ error: "name is required" });
+          return;
+        }
+        const content = learningSyncMgr.readFile(name);
+        if (content === null) {
+          res.status(404).json({ error: `file not found: ${name}` });
+          return;
+        }
+        res.json({ name, content });
+      });
+
+      app.post("/a2a/learning-sync/push", express.json({ limit: "2mb" }), (req, res) => {
+        if (!lsAuthCheck(req, res)) return;
+        const body = req.body || {};
+        const name = typeof body.name === "string" ? body.name : "";
+        const content = typeof body.content === "string" ? body.content : "";
+        const remoteName = typeof body.instanceName === "string" ? body.instanceName : "remote";
+        if (!name || !content) {
+          res.status(400).json({ error: "name and content are required" });
+          return;
+        }
+        const result = learningSyncMgr.receiveFile(name, content, remoteName);
+        void audit.record({
+          ts: new Date().toISOString(),
+          action: "learning_sync_receive",
+          detail: `file=${name} from=${remoteName} action=${result.action} conflicts=${result.conflicts}`,
+          ok: true,
+        });
+        res.json(result);
+      });
+    }
+
     if (config.observability.exposeMetricsEndpoint) {
       app.get(
         config.observability.metricsPath,
@@ -485,6 +564,162 @@ const plugin = {
       const removed = pushManager.unregister(taskId, url);
       respond(true, { removed });
     });
+
+    // ----------------------------------------------------------------
+    // Learning Sync gateway methods
+    // ----------------------------------------------------------------
+
+    api.registerGatewayMethod("a2a.learningSync.manifest", ({ respond }) => {
+      if (!learningSyncMgr) {
+        respond(false, { error: "learningSync is not enabled" });
+        return;
+      }
+      const manifest = learningSyncMgr.getManifest();
+      respond(true, { instanceName: config.learningSync.instanceName, manifest });
+    });
+
+    api.registerGatewayMethod("a2a.learningSync.fetch", ({ params, respond }) => {
+      if (!learningSyncMgr) {
+        respond(false, { error: "learningSync is not enabled" });
+        return;
+      }
+      const payload = asObject(params);
+      const name = asString(payload.name, "");
+      if (!name) {
+        respond(false, { error: "name is required" });
+        return;
+      }
+      const content = learningSyncMgr.readFile(name);
+      if (content === null) {
+        respond(false, { error: `file not found: ${name}` });
+        return;
+      }
+      respond(true, { name, content });
+    });
+
+    api.registerGatewayMethod("a2a.learningSync.push", ({ params, respond }) => {
+      if (!learningSyncMgr) {
+        respond(false, { error: "learningSync is not enabled" });
+        return;
+      }
+      const payload = asObject(params);
+      const name = asString(payload.name, "");
+      const content = asString(payload.content, "");
+      const remoteName = asString(payload.instanceName, "remote");
+      if (!name || !content) {
+        respond(false, { error: "name and content are required" });
+        return;
+      }
+      const result = learningSyncMgr.receiveFile(name, content, remoteName);
+      void audit.record({
+        ts: new Date().toISOString(),
+        action: "learning_sync_receive",
+        detail: `file=${name} from=${remoteName} action=${result.action} conflicts=${result.conflicts}`,
+        ok: true,
+      });
+      respond(true, result);
+    });
+
+    api.registerGatewayMethod("a2a.learningSync.sync", ({ respond }) => {
+      if (!learningSyncMgr) {
+        respond(false, { error: "learningSync is not enabled" });
+        return;
+      }
+      // Trigger a full sync cycle against all peers
+      doLearningSync().then((results) => {
+        respond(true, { results });
+      }).catch((err) => {
+        respond(false, { error: String(err) });
+      });
+    });
+
+    // Full sync cycle: for each peer, exchange manifests and sync missing/changed files via HTTP
+    async function doLearningSync(): Promise<Array<{ peer: string; fetched: number; sent: number; conflicts: number; error?: string }>> {
+      if (!learningSyncMgr) return [];
+      const results: Array<{ peer: string; fetched: number; sent: number; conflicts: number; error?: string }> = [];
+
+      for (const peer of config.peers) {
+        try {
+          const peerBase = new URL(peer.agentCardUrl).origin;
+          const authHeaders: Record<string, string> = {};
+          if (peer.auth?.token) {
+            if (peer.auth.type === "bearer") {
+              authHeaders["authorization"] = `Bearer ${peer.auth.token}`;
+            } else {
+              authHeaders["x-api-key"] = peer.auth.token;
+            }
+          }
+
+          // 1. Get remote manifest
+          const manifestRes = await fetch(`${peerBase}/a2a/learning-sync/manifest`, {
+            headers: authHeaders,
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (!manifestRes.ok) {
+            results.push({ peer: peer.name, fetched: 0, sent: 0, conflicts: 0, error: `manifest HTTP ${manifestRes.status}` });
+            continue;
+          }
+          const remoteData = await manifestRes.json() as { instanceName?: string; manifest?: Array<{ name: string; hash: string; size: number; mtime: number }> };
+          const remoteManifest = remoteData.manifest || [];
+          const remoteName = remoteData.instanceName || peer.name;
+
+          // 2. Diff
+          const diff = learningSyncMgr.diffManifest(remoteManifest);
+          let fetched = 0;
+          let sent = 0;
+          let conflicts = 0;
+
+          // 3. Fetch files we need from remote
+          for (const fileName of diff.toFetch) {
+            const fetchRes = await fetch(`${peerBase}/a2a/learning-sync/fetch`, {
+              method: "POST",
+              headers: { ...authHeaders, "content-type": "application/json" },
+              body: JSON.stringify({ name: fileName }),
+              signal: AbortSignal.timeout(15_000),
+            });
+            if (fetchRes.ok) {
+              const fileData = await fetchRes.json() as { name: string; content: string };
+              if (fileData.content) {
+                const mergeResult = learningSyncMgr.receiveFile(fileName, fileData.content, remoteName);
+                if (mergeResult.action !== "unchanged") fetched++;
+                conflicts += mergeResult.conflicts;
+              }
+            }
+          }
+
+          // 4. Push files the remote needs
+          for (const fileName of diff.toSend) {
+            const content = learningSyncMgr.readFile(fileName);
+            if (content) {
+              await fetch(`${peerBase}/a2a/learning-sync/push`, {
+                method: "POST",
+                headers: { ...authHeaders, "content-type": "application/json" },
+                body: JSON.stringify({
+                  name: fileName,
+                  content,
+                  instanceName: config.learningSync.instanceName,
+                }),
+                signal: AbortSignal.timeout(15_000),
+              });
+              sent++;
+            }
+          }
+
+          results.push({ peer: peer.name, fetched, sent, conflicts });
+          void audit.record({
+            ts: new Date().toISOString(),
+            action: "learning_sync_cycle",
+            peer: peer.name,
+            ok: true,
+            detail: `fetched=${fetched} sent=${sent} conflicts=${conflicts}`,
+          });
+        } catch (err) {
+          results.push({ peer: peer.name, fetched: 0, sent: 0, conflicts: 0, error: String(err) });
+        }
+      }
+
+      return results;
+    }
 
     api.registerGatewayMethod("a2a.send", ({ params, respond }) => {
       const payload = asObject(params);
@@ -780,8 +1015,30 @@ const plugin = {
             `a2a-gateway: peer health checks enabled — interval=${config.resilience.healthCheckIntervalSeconds}s threshold=${config.resilience.circuitBreakerThreshold} cooldown=${config.resilience.circuitBreakerCooldownSeconds}s`,
           );
         }
+
+        // Start learning sync auto-sync
+        if (learningSyncMgr && config.learningSync.autoSyncIntervalSeconds > 0 && config.peers.length > 0) {
+          learningSyncMgr.startAutoSync(async () => {
+            const results = await doLearningSync();
+            for (const r of results) {
+              if (r.error) {
+                api.logger.warn(`a2a-gateway: learning sync with ${r.peer} failed: ${r.error}`);
+              } else if (r.fetched > 0 || r.sent > 0) {
+                api.logger.info(`a2a-gateway: learning sync with ${r.peer}: fetched=${r.fetched} sent=${r.sent} conflicts=${r.conflicts}`);
+              }
+            }
+          });
+          api.logger.info(
+            `a2a-gateway: learning sync enabled — dir=${config.learningSync.memoryDir} interval=${config.learningSync.autoSyncIntervalSeconds}s instance=${config.learningSync.instanceName}`,
+          );
+        }
       },
       async stop(_ctx) {
+        // Stop learning sync
+        if (learningSyncMgr) {
+          learningSyncMgr.stopAutoSync();
+        }
+
         // Stop peer health checks
         peerHealth.stop();
 

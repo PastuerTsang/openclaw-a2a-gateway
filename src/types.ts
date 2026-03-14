@@ -111,6 +111,21 @@ export interface PushNotificationConfig {
   maxDeliveryRetries: number;
 }
 
+// ---------------------------------------------------------------------------
+// Learning sync configuration
+// ---------------------------------------------------------------------------
+
+export interface LearningSyncGatewayConfig {
+  /** Enable learning sync (default false). */
+  enabled: boolean;
+  /** Path to workspace memory directory (default auto-detected from OPENCLAW_HOME). */
+  memoryDir: string;
+  /** Instance name used as source tag when merging (default hostname). */
+  instanceName: string;
+  /** Auto-sync interval in seconds (0 = disabled, default 300 = 5 min). */
+  autoSyncIntervalSeconds: number;
+}
+
 export interface GatewayConfig {
   agentCard: AgentCardConfig;
   server: {
@@ -149,6 +164,7 @@ export interface GatewayConfig {
   };
   resilience: PeerResilienceConfig;
   pushNotifications: PushNotificationConfig;
+  learningSync: LearningSyncGatewayConfig;
 }
 
 // ---------------------------------------------------------------------------

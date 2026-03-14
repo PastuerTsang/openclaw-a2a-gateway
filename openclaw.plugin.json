@@ -255,6 +255,31 @@
             "description": "Max retry attempts for webhook delivery"
           }
         }
+      },
+      "learningSync": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable Learning Sync (Phase 1 Claw-to-Claw): synchronise workspace memory files with peers"
+          },
+          "memoryDir": {
+            "type": "string",
+            "description": "Path to workspace memory directory (default: auto-detected from OPENCLAW_HOME)"
+          },
+          "instanceName": {
+            "type": "string",
+            "description": "Instance name used as source tag when merging (default: hostname)"
+          },
+          "autoSyncIntervalSeconds": {
+            "type": "number",
+            "default": 300,
+            "minimum": 0,
+            "description": "Auto-sync interval in seconds (0 = manual only, default 300 = 5 min)"
+          }
+        }
       }
     }
   },
