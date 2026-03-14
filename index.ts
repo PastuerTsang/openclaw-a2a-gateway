@@ -696,8 +696,16 @@ const plugin = {
             }
           }
 
-          // 4. Push files the remote needs
-          for (const fileName of diff.toSend) {
+          // 4. Push files the remote needs (use post-merge content for files that were also fetched)
+          // Combine: files only on local + files that were in both (merged locally, push merged version)
+          const filesToPush = new Set(diff.toSend);
+          // Also re-push any file that was fetched+merged (both sides had it with different hashes)
+          for (const fileName of diff.toFetch) {
+            if (diff.toSend.includes(fileName)) continue; // already in set
+            // If we fetched and merged, push the merged version back
+            filesToPush.add(fileName);
+          }
+          for (const fileName of filesToPush) {
             const content = learningSyncMgr.readFile(fileName);
             if (content) {
               await fetch(`${peerBase}/a2a/learning-sync/push`, {
