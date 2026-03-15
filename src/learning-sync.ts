@@ -95,11 +95,56 @@ function parseSections(content: string): MemorySection[] {
 }
 
 /**
+ * Extract content blocks from a section body, stripping source tags.
+ * A source-tagged body looks like:
+ *   <!-- source: vm-main -->
+ *   ...lines...
+ *   <!-- source: phone-assist -->
+ *   ...lines...
+ *
+ * Returns an array of { source, content } where content is the trimmed
+ * text of each block.  Untagged lines are attributed to `defaultSource`.
+ */
+function extractBlocks(
+  body: string[],
+  defaultSource: string,
+): Array<{ source: string; content: string }> {
+  const sourceTagRe = /^<!--\s*source:\s*(.+?)\s*-->$/;
+  const blocks: Array<{ source: string; lines: string[] }> = [];
+  let currentSource = defaultSource;
+  let currentLines: string[] = [];
+
+  for (const line of body) {
+    const m = line.match(sourceTagRe);
+    if (m) {
+      // Flush previous block
+      if (currentLines.length > 0) {
+        blocks.push({ source: currentSource, lines: currentLines });
+      }
+      currentSource = m[1].toLowerCase();
+      currentLines = [];
+    } else {
+      currentLines.push(line);
+    }
+  }
+  if (currentLines.length > 0) {
+    blocks.push({ source: currentSource, lines: currentLines });
+  }
+
+  return blocks
+    .map((b) => ({ source: b.source, content: b.lines.join("\n").trim() }))
+    .filter((b) => b.content.length > 0);
+}
+
+/**
  * Merge two sets of sections from the same day.
  * - Sections with the same key (header text) are compared by body content.
  * - If identical, keep one copy.
- * - If different, keep both with source tags.
+ * - If different, collect unique content blocks (deduped) and tag by source.
  * - Sections that exist only on one side are appended.
+ *
+ * This is idempotent: re-merging already-merged content will not grow the file
+ * because duplicate blocks are detected by their normalised text.
  */
 function mergeSections(
   localSections: MemorySection[],
@@ -128,18 +173,42 @@ function mergeSections(
         // Identical — keep one copy
         merged.push(local);
       } else {
-        // Conflict — keep both with source tags
-        merged.push({
-          header: local.header,
-          body: [
-            `<!-- source: ${localName} -->`,
-            ...local.body,
-            "",
-            `<!-- source: ${remoteName} -->`,
-            ...remote.body,
-          ],
-          key: local.key,
-        });
+        // Extract content blocks from both sides, dedup by content hash
+        const localBlocks = extractBlocks(local.body, localName.toLowerCase());
+        const remoteBlocks = extractBlocks(remote.body, remoteName.toLowerCase());
+
+        const seen = new Set<string>();
+        const uniqueBlocks: Array<{ source: string; content: string }> = [];
+
+        for (const block of [...localBlocks, ...remoteBlocks]) {
+          const key = block.content;
+          if (!seen.has(key)) {
+            seen.add(key);
+            uniqueBlocks.push(block);
+          }
+        }
+
+        // If after dedup there's only one unique block, no conflict
+        if (uniqueBlocks.length === 1) {
+          merged.push({
+            header: local.header,
+            body: uniqueBlocks[0].content.split("\n"),
+            key: local.key,
+          });
+        } else {
+          // Multiple distinct blocks — tag each with source
+          const body: string[] = [];
+          for (let i = 0; i < uniqueBlocks.length; i++) {
+            if (i > 0) body.push("");
+            body.push(`<!-- source: ${uniqueBlocks[i].source} -->`);
+            body.push(...uniqueBlocks[i].content.split("\n"));
+          }
+          merged.push({
+            header: local.header,
+            body,
+            key: local.key,
+          });
+        }
       }
     }
   }
