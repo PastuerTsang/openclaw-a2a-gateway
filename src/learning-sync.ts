@@ -94,53 +94,70 @@ function parseSections(content: string): MemorySection[] {
   return sections;
 }
 
-const SOURCE_TAG_RE = /^<!--\s*source:\s*.+?\s*-->$/;
+/**
+ * Merge format version.  Both sides include this in their manifest response.
+ * When both sides report the same version, block-level merge with source
+ * attribution is used.  When versions differ (or the peer has no version),
+ * we fall back to line-level dedup without source tags for safety.
+ */
+export const MERGE_VERSION = 2;
+
+const SOURCE_TAG_RE = /^<!--\s*source:\s*(.+?)\s*-->$/;
 
 /**
- * Strip all source tags and blank lines from a body, returning only
- * meaningful content lines.  This normalises bodies that may have been
- * through different versions of the merge logic (nested tags, etc.).
+ * Strip all source tags from a body, returning only content lines.
  */
 function stripSourceTags(body: string[]): string[] {
   return body.filter((line) => !SOURCE_TAG_RE.test(line));
 }
 
 /**
- * Collect unique non-empty content lines from a body (source tags removed).
- * Returns a sorted, deduplicated array of trimmed lines.
+ * Extract content blocks from a section body, stripping source tags.
+ * Consecutive source tags are collapsed (only the last one before actual
+ * content becomes that block's source).  Empty blocks are discarded.
  */
-function uniqueContentLines(body: string[]): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const line of stripSourceTags(body)) {
-    const trimmed = line.trim();
-    if (trimmed.length > 0 && !seen.has(trimmed)) {
-      seen.add(trimmed);
-      result.push(trimmed);
+function extractBlocks(
+  body: string[],
+  defaultSource: string,
+): Array<{ source: string; content: string }> {
+  const blocks: Array<{ source: string; lines: string[] }> = [];
+  let currentSource = defaultSource;
+  let currentLines: string[] = [];
+
+  for (const line of body) {
+    const m = line.match(SOURCE_TAG_RE);
+    if (m) {
+      // Flush previous block only if it has content
+      if (currentLines.length > 0) {
+        blocks.push({ source: currentSource, lines: currentLines });
+        currentLines = [];
+      }
+      currentSource = m[1].toLowerCase();
+    } else {
+      currentLines.push(line);
     }
   }
-  result.sort();
-  return result;
+  if (currentLines.length > 0) {
+    blocks.push({ source: currentSource, lines: currentLines });
+  }
+
+  return blocks
+    .map((b) => ({ source: b.source, content: b.lines.join("\n").trim() }))
+    .filter((b) => b.content.length > 0);
 }
 
 /**
- * Merge two sets of sections from the same day.
- * - Sections with the same key (header text) are compared by body content.
- * - Source tags (<!-- source: ... -->) are stripped before comparison.
- * - If the unique content lines are identical, keep one copy (no tags).
- * - If different, union all unique lines, sort deterministically, and
- *   write them without source tags (source tracking caused unbounded
- *   growth when the two sides ran different merge logic versions).
- * - Sections that exist only on one side are kept as-is (tags stripped).
+ * Merge two sets of sections — block-level with source attribution.
+ * Used when both sides run MERGE_VERSION >= 2.
  *
- * This is idempotent: re-merging already-merged content produces the
- * exact same output because everything is deduped and sorted.
+ * Idempotent: extractBlocks strips existing tags before dedup, and
+ * blocks are sorted by content so both sides produce identical output.
  */
-function mergeSections(
+function mergeSectionsV2(
   localSections: MemorySection[],
   remoteSections: MemorySection[],
-  _localName: string,
-  _remoteName: string,
+  localName: string,
+  remoteName: string,
 ): MemorySection[] {
   const merged: MemorySection[] = [];
   const usedRemote = new Set<number>();
@@ -151,7 +168,69 @@ function mergeSections(
     );
 
     if (remoteIdx === -1) {
-      // Only on local side — strip any leftover source tags
+      merged.push(local);
+    } else {
+      usedRemote.add(remoteIdx);
+      const remote = remoteSections[remoteIdx];
+
+      // Extract blocks, stripping any pre-existing source tags
+      const localBlocks = extractBlocks(local.body, localName.toLowerCase());
+      const remoteBlocks = extractBlocks(remote.body, remoteName.toLowerCase());
+
+      // Dedup by content text
+      const seen = new Set<string>();
+      const uniqueBlocks: Array<{ source: string; content: string }> = [];
+      for (const block of [...localBlocks, ...remoteBlocks]) {
+        if (!seen.has(block.content)) {
+          seen.add(block.content);
+          uniqueBlocks.push(block);
+        }
+      }
+
+      // Sort by content for deterministic output on both sides
+      uniqueBlocks.sort((a, b) => a.content.localeCompare(b.content));
+
+      if (uniqueBlocks.length === 1) {
+        merged.push({
+          header: local.header,
+          body: uniqueBlocks[0].content.split("\n"),
+          key: local.key,
+        });
+      } else {
+        const body: string[] = [];
+        for (let i = 0; i < uniqueBlocks.length; i++) {
+          if (i > 0) body.push("");
+          body.push(`<!-- source: ${uniqueBlocks[i].source} -->`);
+          body.push(...uniqueBlocks[i].content.split("\n"));
+        }
+        merged.push({ header: local.header, body, key: local.key });
+      }
+    }
+  }
+
+  for (let i = 0; i < remoteSections.length; i++) {
+    if (!usedRemote.has(i)) merged.push(remoteSections[i]);
+  }
+  return merged;
+}
+
+/**
+ * Merge two sets of sections — line-level dedup, no source tags.
+ * Safe fallback when peer runs an older merge version.
+ */
+function mergeSectionsV1(
+  localSections: MemorySection[],
+  remoteSections: MemorySection[],
+): MemorySection[] {
+  const merged: MemorySection[] = [];
+  const usedRemote = new Set<number>();
+
+  for (const local of localSections) {
+    const remoteIdx = remoteSections.findIndex(
+      (r, i) => !usedRemote.has(i) && r.key === local.key,
+    );
+
+    if (remoteIdx === -1) {
       merged.push({
         header: local.header,
         body: stripSourceTags(local.body),
@@ -161,7 +240,6 @@ function mergeSections(
       usedRemote.add(remoteIdx);
       const remote = remoteSections[remoteIdx];
 
-      // Union all unique content lines from both sides
       const seen = new Set<string>();
       const unionLines: string[] = [];
       for (const line of [...stripSourceTags(local.body), ...stripSourceTags(remote.body)]) {
@@ -171,18 +249,11 @@ function mergeSections(
           unionLines.push(trimmed);
         }
       }
-      // Sort for deterministic output on both sides
       unionLines.sort();
-
-      merged.push({
-        header: local.header,
-        body: unionLines,
-        key: local.key,
-      });
+      merged.push({ header: local.header, body: unionLines, key: local.key });
     }
   }
 
-  // Append sections only on remote side (strip source tags)
   for (let i = 0; i < remoteSections.length; i++) {
     if (!usedRemote.has(i)) {
       const sec = remoteSections[i];
@@ -193,8 +264,23 @@ function mergeSections(
       });
     }
   }
-
   return merged;
+}
+
+/**
+ * Dispatch to the appropriate merge strategy based on peer version.
+ */
+function mergeSections(
+  localSections: MemorySection[],
+  remoteSections: MemorySection[],
+  localName: string,
+  remoteName: string,
+  peerMergeVersion?: number,
+): MemorySection[] {
+  if (peerMergeVersion != null && peerMergeVersion >= MERGE_VERSION) {
+    return mergeSectionsV2(localSections, remoteSections, localName, remoteName);
+  }
+  return mergeSectionsV1(localSections, remoteSections);
 }
 
 function sectionsToString(sections: MemorySection[]): string {
@@ -273,6 +359,7 @@ export class LearningSyncManager {
     name: string,
     content: string,
     remoteName: string,
+    peerMergeVersion?: number,
   ): { action: "created" | "merged" | "unchanged"; conflicts: number } {
     if (!isMemoryFile(name)) {
       return { action: "unchanged", conflicts: 0 };
@@ -301,6 +388,7 @@ export class LearningSyncManager {
       remoteSections,
       this.config.instanceName,
       remoteName,
+      peerMergeVersion,
     );
 
     // Count conflicts (sections with both source tags)

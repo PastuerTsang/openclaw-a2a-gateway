@@ -37,7 +37,7 @@ import type {
   PeerConfig,
   RoutingRuleConfig,
 } from "./src/types.js";
-import { LearningSyncManager } from "./src/learning-sync.js";
+import { LearningSyncManager, MERGE_VERSION } from "./src/learning-sync.js";
 import {
   validateUri,
   validateMimeType,
@@ -498,7 +498,7 @@ const plugin = {
       app.get("/a2a/learning-sync/manifest", (req, res) => {
         if (!lsAuthCheck(req, res)) return;
         const manifest = learningSyncMgr.getManifest();
-        res.json({ instanceName: config.learningSync.instanceName, manifest });
+        res.json({ instanceName: config.learningSync.instanceName, mergeVersion: MERGE_VERSION, manifest });
       });
 
       app.post("/a2a/learning-sync/fetch", express.json(), (req, res) => {
@@ -522,11 +522,12 @@ const plugin = {
         const name = typeof body.name === "string" ? body.name : "";
         const content = typeof body.content === "string" ? body.content : "";
         const remoteName = typeof body.instanceName === "string" ? body.instanceName : "remote";
+        const pushMergeVersion = typeof body.mergeVersion === "number" ? body.mergeVersion : undefined;
         if (!name || !content) {
           res.status(400).json({ error: "name and content are required" });
           return;
         }
-        const result = learningSyncMgr.receiveFile(name, content, remoteName);
+        const result = learningSyncMgr.receiveFile(name, content, remoteName, pushMergeVersion);
         void audit.record({
           ts: new Date().toISOString(),
           action: "learning_sync_receive",
@@ -715,9 +716,10 @@ const plugin = {
             results.push({ peer: peer.name, fetched: 0, sent: 0, conflicts: 0, error: `manifest HTTP ${manifestRes.status}` });
             continue;
           }
-          const remoteData = await manifestRes.json() as { instanceName?: string; manifest?: Array<{ name: string; hash: string; size: number; mtime: number }> };
+          const remoteData = await manifestRes.json() as { instanceName?: string; mergeVersion?: number; manifest?: Array<{ name: string; hash: string; size: number; mtime: number }> };
           const remoteManifest = remoteData.manifest || [];
           const remoteName = remoteData.instanceName || peer.name;
+          const peerMergeVersion = remoteData.mergeVersion;
 
           // 2. Diff
           const diff = learningSyncMgr.diffManifest(remoteManifest);
@@ -736,7 +738,7 @@ const plugin = {
             if (fetchRes.ok) {
               const fileData = await fetchRes.json() as { name: string; content: string };
               if (fileData.content) {
-                const mergeResult = learningSyncMgr.receiveFile(fileName, fileData.content, remoteName);
+                const mergeResult = learningSyncMgr.receiveFile(fileName, fileData.content, remoteName, peerMergeVersion);
                 if (mergeResult.action !== "unchanged") fetched++;
                 conflicts += mergeResult.conflicts;
               }
@@ -762,6 +764,7 @@ const plugin = {
                   name: fileName,
                   content,
                   instanceName: config.learningSync.instanceName,
+                  mergeVersion: MERGE_VERSION,
                 }),
                 signal: AbortSignal.timeout(15_000),
               });
