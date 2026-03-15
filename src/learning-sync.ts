@@ -94,63 +94,53 @@ function parseSections(content: string): MemorySection[] {
   return sections;
 }
 
-/**
- * Extract content blocks from a section body, stripping source tags.
- * A source-tagged body looks like:
- *   <!-- source: vm-main -->
- *   ...lines...
- *   <!-- source: phone-assist -->
- *   ...lines...
- *
- * Returns an array of { source, content } where content is the trimmed
- * text of each block.  Untagged lines are attributed to `defaultSource`.
- */
-function extractBlocks(
-  body: string[],
-  defaultSource: string,
-): Array<{ source: string; content: string }> {
-  const sourceTagRe = /^<!--\s*source:\s*(.+?)\s*-->$/;
-  const blocks: Array<{ source: string; lines: string[] }> = [];
-  let currentSource = defaultSource;
-  let currentLines: string[] = [];
+const SOURCE_TAG_RE = /^<!--\s*source:\s*.+?\s*-->$/;
 
-  for (const line of body) {
-    const m = line.match(sourceTagRe);
-    if (m) {
-      // Flush previous block
-      if (currentLines.length > 0) {
-        blocks.push({ source: currentSource, lines: currentLines });
-      }
-      currentSource = m[1].toLowerCase();
-      currentLines = [];
-    } else {
-      currentLines.push(line);
+/**
+ * Strip all source tags and blank lines from a body, returning only
+ * meaningful content lines.  This normalises bodies that may have been
+ * through different versions of the merge logic (nested tags, etc.).
+ */
+function stripSourceTags(body: string[]): string[] {
+  return body.filter((line) => !SOURCE_TAG_RE.test(line));
+}
+
+/**
+ * Collect unique non-empty content lines from a body (source tags removed).
+ * Returns a sorted, deduplicated array of trimmed lines.
+ */
+function uniqueContentLines(body: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const line of stripSourceTags(body)) {
+    const trimmed = line.trim();
+    if (trimmed.length > 0 && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      result.push(trimmed);
     }
   }
-  if (currentLines.length > 0) {
-    blocks.push({ source: currentSource, lines: currentLines });
-  }
-
-  return blocks
-    .map((b) => ({ source: b.source, content: b.lines.join("\n").trim() }))
-    .filter((b) => b.content.length > 0);
+  result.sort();
+  return result;
 }
 
 /**
  * Merge two sets of sections from the same day.
  * - Sections with the same key (header text) are compared by body content.
- * - If identical, keep one copy.
- * - If different, collect unique content blocks (deduped) and tag by source.
- * - Sections that exist only on one side are appended.
+ * - Source tags (<!-- source: ... -->) are stripped before comparison.
+ * - If the unique content lines are identical, keep one copy (no tags).
+ * - If different, union all unique lines, sort deterministically, and
+ *   write them without source tags (source tracking caused unbounded
+ *   growth when the two sides ran different merge logic versions).
+ * - Sections that exist only on one side are kept as-is (tags stripped).
  *
- * This is idempotent: re-merging already-merged content will not grow the file
- * because duplicate blocks are detected by their normalised text.
+ * This is idempotent: re-merging already-merged content produces the
+ * exact same output because everything is deduped and sorted.
  */
 function mergeSections(
   localSections: MemorySection[],
   remoteSections: MemorySection[],
-  localName: string,
-  remoteName: string,
+  _localName: string,
+  _remoteName: string,
 ): MemorySection[] {
   const merged: MemorySection[] = [];
   const usedRemote = new Set<number>();
@@ -161,59 +151,46 @@ function mergeSections(
     );
 
     if (remoteIdx === -1) {
-      // Only on local side
-      merged.push(local);
+      // Only on local side — strip any leftover source tags
+      merged.push({
+        header: local.header,
+        body: stripSourceTags(local.body),
+        key: local.key,
+      });
     } else {
       usedRemote.add(remoteIdx);
       const remote = remoteSections[remoteIdx];
 
-      // Extract content blocks from both sides, stripping source tags
-      const localBlocks = extractBlocks(local.body, localName.toLowerCase());
-      const remoteBlocks = extractBlocks(remote.body, remoteName.toLowerCase());
-
-      // Dedup by content text
+      // Union all unique content lines from both sides
       const seen = new Set<string>();
-      const uniqueBlocks: Array<{ source: string; content: string }> = [];
-
-      for (const block of [...localBlocks, ...remoteBlocks]) {
-        const key = block.content;
-        if (!seen.has(key)) {
-          seen.add(key);
-          uniqueBlocks.push(block);
+      const unionLines: string[] = [];
+      for (const line of [...stripSourceTags(local.body), ...stripSourceTags(remote.body)]) {
+        const trimmed = line.trim();
+        if (trimmed.length > 0 && !seen.has(trimmed)) {
+          seen.add(trimmed);
+          unionLines.push(trimmed);
         }
       }
+      // Sort for deterministic output on both sides
+      unionLines.sort();
 
-      // Sort blocks deterministically (by content) so both sides converge
-      uniqueBlocks.sort((a, b) => a.content.localeCompare(b.content));
-
-      // If after dedup there's only one unique block, no conflict
-      if (uniqueBlocks.length === 1) {
-        merged.push({
-          header: local.header,
-          body: uniqueBlocks[0].content.split("\n"),
-          key: local.key,
-        });
-      } else {
-        // Multiple distinct blocks — tag each with source
-        const body: string[] = [];
-        for (let i = 0; i < uniqueBlocks.length; i++) {
-          if (i > 0) body.push("");
-          body.push(`<!-- source: ${uniqueBlocks[i].source} -->`);
-          body.push(...uniqueBlocks[i].content.split("\n"));
-        }
-        merged.push({
-          header: local.header,
-          body,
-          key: local.key,
-        });
-      }
+      merged.push({
+        header: local.header,
+        body: unionLines,
+        key: local.key,
+      });
     }
   }
 
-  // Append sections only on remote side
+  // Append sections only on remote side (strip source tags)
   for (let i = 0; i < remoteSections.length; i++) {
     if (!usedRemote.has(i)) {
-      merged.push(remoteSections[i]);
+      const sec = remoteSections[i];
+      merged.push({
+        header: sec.header,
+        body: stripSourceTags(sec.body),
+        key: sec.key,
+      });
     }
   }
 
