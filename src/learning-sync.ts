@@ -166,49 +166,46 @@ function mergeSections(
     } else {
       usedRemote.add(remoteIdx);
       const remote = remoteSections[remoteIdx];
-      const localBody = local.body.join("\n").trim();
-      const remoteBody = remote.body.join("\n").trim();
 
-      if (localBody === remoteBody) {
-        // Identical — keep one copy
-        merged.push(local);
+      // Extract content blocks from both sides, stripping source tags
+      const localBlocks = extractBlocks(local.body, localName.toLowerCase());
+      const remoteBlocks = extractBlocks(remote.body, remoteName.toLowerCase());
+
+      // Dedup by content text
+      const seen = new Set<string>();
+      const uniqueBlocks: Array<{ source: string; content: string }> = [];
+
+      for (const block of [...localBlocks, ...remoteBlocks]) {
+        const key = block.content;
+        if (!seen.has(key)) {
+          seen.add(key);
+          uniqueBlocks.push(block);
+        }
+      }
+
+      // Sort blocks deterministically (by content) so both sides converge
+      uniqueBlocks.sort((a, b) => a.content.localeCompare(b.content));
+
+      // If after dedup there's only one unique block, no conflict
+      if (uniqueBlocks.length === 1) {
+        merged.push({
+          header: local.header,
+          body: uniqueBlocks[0].content.split("\n"),
+          key: local.key,
+        });
       } else {
-        // Extract content blocks from both sides, dedup by content hash
-        const localBlocks = extractBlocks(local.body, localName.toLowerCase());
-        const remoteBlocks = extractBlocks(remote.body, remoteName.toLowerCase());
-
-        const seen = new Set<string>();
-        const uniqueBlocks: Array<{ source: string; content: string }> = [];
-
-        for (const block of [...localBlocks, ...remoteBlocks]) {
-          const key = block.content;
-          if (!seen.has(key)) {
-            seen.add(key);
-            uniqueBlocks.push(block);
-          }
+        // Multiple distinct blocks — tag each with source
+        const body: string[] = [];
+        for (let i = 0; i < uniqueBlocks.length; i++) {
+          if (i > 0) body.push("");
+          body.push(`<!-- source: ${uniqueBlocks[i].source} -->`);
+          body.push(...uniqueBlocks[i].content.split("\n"));
         }
-
-        // If after dedup there's only one unique block, no conflict
-        if (uniqueBlocks.length === 1) {
-          merged.push({
-            header: local.header,
-            body: uniqueBlocks[0].content.split("\n"),
-            key: local.key,
-          });
-        } else {
-          // Multiple distinct blocks — tag each with source
-          const body: string[] = [];
-          for (let i = 0; i < uniqueBlocks.length; i++) {
-            if (i > 0) body.push("");
-            body.push(`<!-- source: ${uniqueBlocks[i].source} -->`);
-            body.push(...uniqueBlocks[i].content.split("\n"));
-          }
-          merged.push({
-            header: local.header,
-            body,
-            key: local.key,
-          });
-        }
+        merged.push({
+          header: local.header,
+          body,
+          key: local.key,
+        });
       }
     }
   }
