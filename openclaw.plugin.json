@@ -280,6 +280,64 @@
             "description": "Auto-sync interval in seconds (0 = manual only, default 300 = 5 min)"
           }
         }
+      },
+      "delegation": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Task Delegation (Phase 2 Claw-to-Claw): delegate tasks to peer agents and receive structured results",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable task delegation"
+          },
+          "policy": {
+            "type": "array",
+            "description": "Policy rules controlling which peers can receive which task types",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "peer": {
+                  "type": "string",
+                  "description": "Peer name (must match a configured peer)"
+                },
+                "allowedTaskTypes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": ["query", "device", "operation", "custom"]
+                  },
+                  "description": "Task types this peer is allowed to receive"
+                },
+                "maxConcurrent": {
+                  "type": "number",
+                  "minimum": 1,
+                  "description": "Max concurrent delegations to this peer (optional)"
+                }
+              },
+              "required": ["peer", "allowedTaskTypes"]
+            }
+          },
+          "defaultTimeoutMs": {
+            "type": "number",
+            "default": 120000,
+            "minimum": 1000,
+            "description": "Default timeout in ms for waiting on delegation results (default 120000)"
+          },
+          "pollIntervalMs": {
+            "type": "number",
+            "default": 2000,
+            "minimum": 500,
+            "description": "Interval between polling attempts in ms (default 2000)"
+          },
+          "maxPollAttempts": {
+            "type": "number",
+            "default": 60,
+            "minimum": 1,
+            "description": "Max number of poll attempts before timeout (default 60)"
+          }
+        }
       }
     }
   },

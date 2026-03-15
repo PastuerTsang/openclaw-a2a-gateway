@@ -7,6 +7,7 @@
  */
 
 import type { Server } from "node:http";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -26,6 +27,9 @@ import { FileTaskStore } from "./src/task-store.js";
 import { GatewayTelemetry } from "./src/telemetry.js";
 import type {
   AgentCardConfig,
+  DelegationConfig,
+  DelegationPolicyRule,
+  DelegationTaskType,
   GatewayConfig,
   InboundAuth,
   LearningSyncGatewayConfig,
@@ -41,6 +45,7 @@ import {
 import { AuditLogger } from "./src/audit.js";
 import { PeerHealthTracker, withRetry } from "./src/peer-health.js";
 import { PushNotificationManager } from "./src/push-notifications.js";
+import { DelegationManager } from "./src/delegation.js";
 
 /** Build a JSON-RPC error response. */
 function jsonRpcError(id: string | number | null, code: number, message: string) {
@@ -161,6 +166,27 @@ function parseRoutingRules(raw: unknown): RoutingRuleConfig[] {
   return rules;
 }
 
+const VALID_DELEGATION_TASK_TYPES = new Set<DelegationTaskType>(["query", "device", "operation", "custom"]);
+
+function parseDelegationPolicy(raw: unknown): DelegationPolicyRule[] {
+  if (!Array.isArray(raw)) return [];
+  const rules: DelegationPolicyRule[] = [];
+  for (const entry of raw) {
+    const value = asObject(entry);
+    const peer = asString(value.peer, "");
+    if (!peer) continue;
+    const rawTypes = Array.isArray(value.allowedTaskTypes) ? value.allowedTaskTypes : [];
+    const allowedTaskTypes = (rawTypes
+      .filter((t: unknown) => typeof t === "string" && VALID_DELEGATION_TASK_TYPES.has(t as DelegationTaskType))
+    ) as DelegationTaskType[];
+    if (allowedTaskTypes.length === 0) continue;
+    const maxConcurrent = typeof value.maxConcurrent === "number" && value.maxConcurrent > 0
+      ? Math.floor(value.maxConcurrent) : undefined;
+    rules.push({ peer, allowedTaskTypes, maxConcurrent });
+  }
+  return rules;
+}
+
 function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): GatewayConfig {
   const config = asObject(raw);
   const server = asObject(config.server);
@@ -173,6 +199,7 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
   const resilience = asObject(config.resilience);
   const pushNotifications = asObject(config.pushNotifications);
   const learningSync = asObject(config.learningSync);
+  const delegation = asObject(config.delegation);
 
   const inboundAuth = asString(security.inboundAuth, "none") as InboundAuth;
 
@@ -249,6 +276,13 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
       ),
       instanceName: asString(learningSync.instanceName, "") || os.hostname(),
       autoSyncIntervalSeconds: Math.max(0, asNumber(learningSync.autoSyncIntervalSeconds, 300)),
+    },
+    delegation: {
+      enabled: asBoolean(delegation.enabled, false),
+      policy: parseDelegationPolicy(delegation.policy),
+      defaultTimeoutMs: Math.max(1000, asNumber(delegation.defaultTimeoutMs, 120_000)),
+      pollIntervalMs: Math.max(500, asNumber(delegation.pollIntervalMs, 2_000)),
+      maxPollAttempts: Math.max(1, asNumber(delegation.maxPollAttempts, 60)),
     },
   };
 }
@@ -512,6 +546,19 @@ const plugin = {
       });
     }
 
+    // STATUS.md read endpoint — lets any peer fetch current project status
+    app.get("/a2a/status", (_req, res) => {
+      const statusPath = path.resolve(
+        path.dirname(new URL(import.meta.url).pathname),
+        "STATUS.md",
+      );
+      if (fs.existsSync(statusPath)) {
+        res.type("text/markdown").send(fs.readFileSync(statusPath, "utf8"));
+      } else {
+        res.status(404).json({ error: "STATUS.md not found" });
+      }
+    });
+
     if (config.observability.exposeMetricsEndpoint) {
       app.get(
         config.observability.metricsPath,
@@ -738,6 +785,79 @@ const plugin = {
       return results;
     }
 
+    // ----------------------------------------------------------------
+    // Delegation (Phase 2 Claw-to-Claw)
+    // ----------------------------------------------------------------
+
+    const delegationMgr = config.delegation.enabled
+      ? new DelegationManager(
+          config.delegation,
+          config.peers,
+          client,
+          peerHealth,
+          audit,
+          api.logger,
+        )
+      : null;
+
+    api.registerGatewayMethod("a2a.delegate", ({ params, respond }) => {
+      if (!delegationMgr) {
+        respond(false, { error: "delegation is not enabled" });
+        return;
+      }
+      const payload = asObject(params);
+      const peer = asString(payload.peer, "");
+      const taskType = asString(payload.taskType, "") as any;
+      const message = asString(payload.message, "");
+      const waitForResult = payload.waitForResult !== undefined ? asBoolean(payload.waitForResult, true) : true;
+      const timeoutMs = payload.timeoutMs !== undefined ? asNumber(payload.timeoutMs, 0) : undefined;
+
+      if (!peer || !taskType || !message) {
+        respond(false, { error: "peer, taskType, and message are required" });
+        return;
+      }
+      if (!VALID_DELEGATION_TASK_TYPES.has(taskType)) {
+        respond(false, { error: `Invalid taskType: "${taskType}". Must be one of: query, device, operation, custom` });
+        return;
+      }
+
+      delegationMgr.delegate({ peer, taskType, message, waitForResult, timeoutMs: timeoutMs || undefined })
+        .then((result) => {
+          const ok = result.status === "completed" || result.status === "pending" || result.status === "working";
+          respond(ok, result);
+        })
+        .catch((err) => {
+          respond(false, { error: String(err?.message || err) });
+        });
+    });
+
+    api.registerGatewayMethod("a2a.delegate.status", ({ params, respond }) => {
+      if (!delegationMgr) {
+        respond(false, { error: "delegation is not enabled" });
+        return;
+      }
+      const payload = asObject(params);
+      const delegationId = asString(payload.delegationId, "");
+      if (!delegationId) {
+        respond(false, { error: "delegationId is required" });
+        return;
+      }
+      const status = delegationMgr.getStatus(delegationId);
+      if (!status) {
+        respond(false, { error: `Delegation not found: ${delegationId}` });
+        return;
+      }
+      respond(true, status);
+    });
+
+    api.registerGatewayMethod("a2a.delegate.list", ({ respond }) => {
+      if (!delegationMgr) {
+        respond(false, { error: "delegation is not enabled" });
+        return;
+      }
+      respond(true, { delegations: delegationMgr.listAll() });
+    });
+
     api.registerGatewayMethod("a2a.send", ({ params, respond }) => {
       const payload = asObject(params);
       const peerName = asString(payload.peer || payload.name, "");
@@ -920,6 +1040,90 @@ const plugin = {
           }
         },
       });
+    }
+
+    // ------------------------------------------------------------------
+    // Agent tool: a2a_delegate
+    // Lets the agent delegate tasks to a peer and get structured results.
+    // ------------------------------------------------------------------
+    if (api.registerTool && delegationMgr) {
+      const delegateParams = {
+        type: "object" as const,
+        required: ["peer", "taskType", "message"],
+        properties: {
+          peer: { type: "string" as const, description: "Name of the target peer (must match a configured peer name)" },
+          taskType: { type: "string" as const, enum: ["query", "device", "operation", "custom"], description: "Type of task to delegate" },
+          message: { type: "string" as const, description: "The task instruction / message to send to the peer" },
+          waitForResult: { type: "boolean" as const, description: "Wait for the task to complete before returning (default true)" },
+          timeoutMs: { type: "number" as const, description: "Max milliseconds to wait for result (default from config, typically 120000)" },
+        },
+      };
+
+      api.registerTool({
+        name: "a2a_delegate",
+        description: "Delegate a task to a peer agent via A2A. The peer will execute the task and return a structured result. " +
+          "Use this when you need another agent (e.g. on a phone or different machine) to perform an action on your behalf.",
+        label: "A2A Delegate Task",
+        parameters: delegateParams,
+        async execute(_toolCallId, params) {
+          const result = await delegationMgr!.delegate({
+            peer: params.peer,
+            taskType: params.taskType as DelegationTaskType,
+            message: params.message,
+            waitForResult: params.waitForResult !== undefined ? params.waitForResult : true,
+            timeoutMs: params.timeoutMs || undefined,
+          });
+
+          const ok = result.status === "completed";
+          const summary = ok
+            ? `Delegation to ${result.peer} completed.\n${result.result?.text || "(no text result)"}`
+            : `Delegation to ${result.peer} ${result.status}: ${result.error || "(no details)"}`;
+
+          return {
+            content: [{ type: "text" as const, text: summary }],
+            details: { ok, ...result },
+          };
+        },
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // Hook: Inject delegation-aware system prompt for A2A inbound tasks
+    //
+    // When an inbound A2A message lands on a delegation session (detected
+    // via sessionKey pattern + delegation prefix in the prompt), override
+    // the system prompt so the agent treats it as an isolated, fresh task
+    // instead of resuming a prior conversation.
+    // ------------------------------------------------------------------
+    if (config.delegation.enabled && api.on) {
+      const DELEGATION_PREFIX_RE = /\[Delegated Task\s*\|/;
+      const A2A_SESSION_RE = /:a2a:/;
+
+      api.on("before_prompt_build", (event, ctx) => {
+        const sessionKey = ctx.sessionKey || "";
+        const prompt = event.prompt || "";
+
+        // Only activate for A2A sessions carrying a delegation marker
+        if (!A2A_SESSION_RE.test(sessionKey) || !DELEGATION_PREFIX_RE.test(prompt)) {
+          return;
+        }
+
+        return {
+          systemPrompt: [
+            "You are an OpenClaw agent executing a delegated task from a peer agent.",
+            "This is a NEW, INDEPENDENT task — you have NO prior conversation context.",
+            "Instructions:",
+            "- Read the task description carefully and execute it directly.",
+            "- Use available tools (calendar, web search, file access, etc.) as needed.",
+            "- Reply in the SAME LANGUAGE as the task message.",
+            "- Be concise and action-oriented. Return the result, not meta-commentary.",
+            "- Do NOT reference previous conversations, sessions, or attempts.",
+            "- If you cannot complete the task, explain why clearly.",
+          ].join("\n"),
+        };
+      });
+
+      api.logger.info("a2a-gateway: delegation prompt hook registered");
     }
 
     if (!api.registerService) {

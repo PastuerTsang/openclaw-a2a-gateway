@@ -12,7 +12,7 @@ import path from "node:path";
 
 export interface AuditEntry {
   ts: string;
-  action: "inbound" | "outbound" | "auth_rejected" | "file_send" | "task_state_change" | "push_notification" | "learning_sync_receive" | "learning_sync_cycle";
+  action: "inbound" | "outbound" | "auth_rejected" | "file_send" | "task_state_change" | "push_notification" | "learning_sync_receive" | "learning_sync_cycle" | "delegation_send" | "delegation_complete" | "delegation_fail" | "delegation_timeout";
   peer?: string;
   taskId?: string;
   contextId?: string;

@@ -14,6 +14,12 @@ import type { MessageSendParams, Message } from "@a2a-js/sdk";
 
 import type { OutboundSendResult, PeerConfig } from "./types.js";
 
+export interface TaskGetResult {
+  ok: boolean;
+  task?: Record<string, unknown>;
+  error?: string;
+}
+
 /**
  * Build an AuthenticationHandler for bearer or apiKey auth.
  */
@@ -98,6 +104,48 @@ export class A2AClient {
   }
 
   /**
+   * Retrieve a task by ID from a peer using the A2A tasks/get JSON-RPC method.
+   */
+  async getTask(peer: PeerConfig, taskId: string): Promise<TaskGetResult> {
+    const { baseUrl } = parseAgentCardUrl(peer.agentCardUrl);
+    const authHandler = createAuthHandler(peer);
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+    };
+    if (authHandler) {
+      const authHeaders = (await authHandler.headers()) as Record<string, string>;
+      Object.assign(headers, authHeaders);
+    }
+
+    try {
+      const response = await fetch(`${baseUrl}/a2a/jsonrpc`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: uuidv4(),
+          method: "tasks/get",
+          params: { id: taskId },
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if (!response.ok) {
+        return { ok: false, error: `HTTP ${response.status}` };
+      }
+
+      const data = (await response.json()) as { result?: Record<string, unknown>; error?: { message?: string } };
+      if (data.error) {
+        return { ok: false, error: data.error.message || "Unknown JSON-RPC error" };
+      }
+
+      return { ok: true, task: data.result };
+    } catch (err: unknown) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
    * Send a message to a peer agent using the A2A SDK Client.
    *
    * Uses ClientFactory → createFromUrl → client.sendMessage(),
@@ -120,6 +168,13 @@ export class A2AClient {
           { kind: "text", text: String(message.text || message.message || "") },
         ],
       };
+
+      // A2A contextId: when provided, sets the conversation context on the receiving end.
+      // Delegation uses fresh contextIds to ensure task isolation.
+      const contextId = typeof (message as any)?.contextId === "string" ? String((message as any).contextId) : "";
+      if (contextId) {
+        outboundMessage.contextId = contextId;
+      }
 
       // OpenClaw extension: allow per-message routing to a specific agentId on the peer.
       // Note: gRPC transport uses protobuf Message and may drop unknown fields.

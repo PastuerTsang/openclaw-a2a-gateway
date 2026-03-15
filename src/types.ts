@@ -126,6 +126,44 @@ export interface LearningSyncGatewayConfig {
   autoSyncIntervalSeconds: number;
 }
 
+// ---------------------------------------------------------------------------
+// Delegation configuration (Phase 2 Claw-to-Claw)
+// ---------------------------------------------------------------------------
+
+export type DelegationTaskType = "query" | "device" | "operation" | "custom";
+
+export interface DelegationPolicyRule {
+  peer: string;
+  allowedTaskTypes: DelegationTaskType[];
+  maxConcurrent?: number;
+}
+
+export interface DelegationConfig {
+  /** Enable task delegation (default false). */
+  enabled: boolean;
+  /** Policy rules controlling which peers can receive which task types. */
+  policy: DelegationPolicyRule[];
+  /** Default timeout for waiting on delegation results (default 120000ms). */
+  defaultTimeoutMs: number;
+  /** Interval between polling attempts (default 2000ms). */
+  pollIntervalMs: number;
+  /** Max number of poll attempts before timeout (default 60). */
+  maxPollAttempts: number;
+}
+
+export interface DelegationResult {
+  delegationId: string;
+  remoteTaskId: string;
+  peer: string;
+  taskType: DelegationTaskType;
+  status: "pending" | "working" | "completed" | "failed" | "timeout";
+  result?: { text?: string; data?: unknown; artifacts?: unknown[] };
+  error?: string;
+  startedAt: string;
+  completedAt?: string;
+  durationMs?: number;
+}
+
 export interface GatewayConfig {
   agentCard: AgentCardConfig;
   server: {
@@ -165,6 +203,7 @@ export interface GatewayConfig {
   resilience: PeerResilienceConfig;
   pushNotifications: PushNotificationConfig;
   learningSync: LearningSyncGatewayConfig;
+  delegation: DelegationConfig;
 }
 
 // ---------------------------------------------------------------------------
