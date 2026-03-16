@@ -1,5 +1,5 @@
 ---
-lastUpdated: "2026-03-15T12:00:00+08:00"
+lastUpdated: "2026-03-16T23:46:00+08:00"
 updatedBy: "VM-Main"
 ---
 
@@ -12,13 +12,17 @@ updatedBy: "VM-Main"
 - [ ] Phase 3: Shared Memory Query
 
 ## 當前狀態
-- Phase 2 blocker: 手機端 Codex OAuth 過期，無法執行實際委派任務
+- Phase 2 delegation 已驗證修復（2026-03-16 VM→Phone 雙向測試通過）
 - 穩定觀察期開始：2026-03-14
+- ~~Phase 2 blocker: 手機端 Codex OAuth 過期~~ — 已解決
 
 ## 近期變更
 ### VM-Main
+- 2026-03-16: fix: a2a_delegate 測試通過，circuit breaker 重置，Phase 2 確認修復
+- 2026-03-16: feat: 收錄 Codex 產生的 agent 技能、同步協議與治理文件 (388d2cb)
 - 2026-03-15: feat: 新增 STATUS.md 共享進度機制
 - 2026-03-14: fix: sort merged sections / push merged content back to peer
 
 ### Phone-Assist
-（等待 phone 端更新）
+- 2026-03-16: fix: A2A plugin 遷移、gateway 重啟、B2 問題調查（dispatch timeout + circuit breaker）
+（等待 phone 端補充更新）
