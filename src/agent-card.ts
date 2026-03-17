@@ -44,7 +44,7 @@ export function buildAgentCard(config: GatewayConfig): AgentCard {
     ? (configuredUrl ? new URL(configuredUrl).hostname : "localhost")
     : server.host;
 
-  return {
+  const card: AgentCard = {
     protocolVersion: "0.3.0",
     version: "1.0.0",
     name: agentCard.name || "OpenClaw A2A Gateway",
@@ -67,4 +67,26 @@ export function buildAgentCard(config: GatewayConfig): AgentCard {
       { url: `${grpcHost}:${grpcPort}`, transport: "GRPC" },
     ],
   };
+
+  // Phase 3: Advertise memory-query capability
+  if (config.memoryQuery?.enabled && config.learningSync?.enabled) {
+    card.skills.push({
+      id: "memory-query",
+      name: "Memory Query",
+      description: "Search this agent's memory store via POST /a2a/memory/query",
+      tags: ["memory", "search", "openclaw"],
+      examples: ["Search for notes about deployment", "Find memories from 2026-03-16"],
+    });
+
+    (card as any).extensions = {
+      "openclaw:memoryQuery": {
+        version: "1.0",
+        endpoint: "/a2a/memory/query",
+        maxResults: config.memoryQuery.maxResults,
+        rateLimitPerMinute: config.memoryQuery.rateLimitPerMinute,
+      },
+    };
+  }
+
+  return card;
 }

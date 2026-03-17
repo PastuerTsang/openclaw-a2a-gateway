@@ -164,6 +164,58 @@ export interface DelegationResult {
   durationMs?: number;
 }
 
+// ---------------------------------------------------------------------------
+// Memory query configuration (Phase 3 Claw-to-Claw)
+// ---------------------------------------------------------------------------
+
+export interface MemoryQueryConfig {
+  /** Enable memory query endpoint (default: auto-enabled when learningSync is enabled). */
+  enabled: boolean;
+  /** Max results returned per query (default 10). */
+  maxResults: number;
+  /** Max total characters across all returned snippets (default 8000, ~2000 tokens). */
+  maxTotalChars: number;
+  /** Rate limit: max queries per minute per peer (default 10). */
+  rateLimitPerMinute: number;
+  /** Exclude content that has been synced within this many seconds (0 = no dedup, default 0). */
+  deduplicateSyncedWithinSeconds: number;
+}
+
+export interface MemoryQueryRequest {
+  /** Free-text search query (matched against section headers and body). */
+  query: string;
+  /** Optional: restrict search to a specific date (YYYY-MM-DD). */
+  date?: string;
+  /** Optional: restrict search to files matching this glob pattern (e.g. "2026-03-*"). */
+  filePattern?: string;
+  /** Optional: max results to return (capped by server's maxResults). */
+  maxResults?: number;
+  /** Optional: exclude content already present in these file hashes (for dedup). */
+  knownHashes?: string[];
+}
+
+export interface MemoryQueryMatch {
+  /** Source file name (e.g. "2026-03-16.md"). */
+  fileName: string;
+  /** Section header (e.g. "## 2026-03-16 14:30 UTC"). */
+  sectionHeader: string;
+  /** Matched content snippet (trimmed). */
+  snippet: string;
+  /** Relevance score (0-1, higher = more relevant). */
+  score: number;
+}
+
+export interface MemoryQueryResponse {
+  /** Instance name of the responding node. */
+  instanceName: string;
+  /** Matches found. */
+  matches: MemoryQueryMatch[];
+  /** Total matches found before truncation. */
+  totalFound: number;
+  /** Whether results were truncated due to limits. */
+  truncated: boolean;
+}
+
 export interface GatewayConfig {
   agentCard: AgentCardConfig;
   server: {
@@ -204,6 +256,7 @@ export interface GatewayConfig {
   pushNotifications: PushNotificationConfig;
   learningSync: LearningSyncGatewayConfig;
   delegation: DelegationConfig;
+  memoryQuery: MemoryQueryConfig;
 }
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ import {
 import { GrpcTransportFactory } from "@a2a-js/sdk/client/grpc";
 import type { MessageSendParams, Message } from "@a2a-js/sdk";
 
-import type { OutboundSendResult, PeerConfig } from "./types.js";
+import type { MemoryQueryRequest, MemoryQueryResponse, OutboundSendResult, PeerConfig } from "./types.js";
 
 export interface TaskGetResult {
   ok: boolean;
@@ -151,6 +151,43 @@ export class A2AClient {
    * Uses ClientFactory → createFromUrl → client.sendMessage(),
    * following the official @a2a-js/sdk best practice.
    */
+  /**
+   * Query a peer's memory via their /a2a/memory/query REST endpoint.
+   */
+  async queryMemory(
+    peer: PeerConfig,
+    request: MemoryQueryRequest,
+  ): Promise<{ ok: boolean; response?: MemoryQueryResponse; error?: string }> {
+    const { baseUrl } = parseAgentCardUrl(peer.agentCardUrl);
+    const authHandler = createAuthHandler(peer);
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+    };
+    if (authHandler) {
+      const authHeaders = (await authHandler.headers()) as Record<string, string>;
+      Object.assign(headers, authHeaders);
+    }
+
+    try {
+      const response = await fetch(`${baseUrl}/a2a/memory/query`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request),
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => "");
+        return { ok: false, error: `HTTP ${response.status}: ${errorBody}` };
+      }
+
+      const data = (await response.json()) as MemoryQueryResponse;
+      return { ok: true, response: data };
+    } catch (err: unknown) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   async sendMessage(peer: PeerConfig, message: Record<string, unknown>): Promise<OutboundSendResult> {
     const { baseUrl } = parseAgentCardUrl(peer.agentCardUrl);
     const { factory, path } = this.buildFactory(peer);

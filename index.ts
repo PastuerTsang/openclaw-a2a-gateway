@@ -33,11 +33,13 @@ import type {
   GatewayConfig,
   InboundAuth,
   LearningSyncGatewayConfig,
+  MemoryQueryRequest,
+  MemoryQueryResponse,
   OpenClawPluginApi,
   PeerConfig,
   RoutingRuleConfig,
 } from "./src/types.js";
-import { LearningSyncManager, MERGE_VERSION } from "./src/learning-sync.js";
+import { LearningSyncManager, MERGE_VERSION, type MemoryFileEntry } from "./src/learning-sync.js";
 import {
   validateUri,
   validateMimeType,
@@ -200,6 +202,7 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
   const pushNotifications = asObject(config.pushNotifications);
   const learningSync = asObject(config.learningSync);
   const delegation = asObject(config.delegation);
+  const memoryQuery = asObject(config.memoryQuery);
 
   const inboundAuth = asString(security.inboundAuth, "none") as InboundAuth;
 
@@ -283,6 +286,13 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
       defaultTimeoutMs: Math.max(1000, asNumber(delegation.defaultTimeoutMs, 120_000)),
       pollIntervalMs: Math.max(500, asNumber(delegation.pollIntervalMs, 2_000)),
       maxPollAttempts: Math.max(1, asNumber(delegation.maxPollAttempts, 60)),
+    },
+    memoryQuery: {
+      enabled: asBoolean(memoryQuery.enabled, asBoolean(learningSync.enabled, false)),
+      maxResults: Math.min(50, Math.max(1, asNumber(memoryQuery.maxResults, 10))),
+      maxTotalChars: Math.max(500, asNumber(memoryQuery.maxTotalChars, 8000)),
+      rateLimitPerMinute: Math.max(1, asNumber(memoryQuery.rateLimitPerMinute, 10)),
+      deduplicateSyncedWithinSeconds: Math.max(0, asNumber(memoryQuery.deduplicateSyncedWithinSeconds, 0)),
     },
   };
 }
@@ -547,6 +557,74 @@ const plugin = {
       });
     }
 
+    // Memory Query HTTP endpoint (Phase 3)
+    const memoryQueryRateLimit = new Map<string, number[]>();
+    if (config.memoryQuery.enabled && config.learningSync.enabled && learningSyncMgr) {
+      const mqAuthCheck = (req: express.Request, res: express.Response): boolean => {
+        if (config.security.inboundAuth === "bearer" && acceptedTokens.size > 0) {
+          if (!validateBearerToken(req.headers.authorization)) {
+            res.status(401).json({ error: "Unauthorized" });
+            return false;
+          }
+        }
+        return true;
+      };
+
+      app.post("/a2a/memory/query", express.json(), (req, res) => {
+        if (!mqAuthCheck(req, res)) return;
+
+        // Rate limit by IP
+        const clientKey = req.ip || "unknown";
+        const now = Date.now();
+        let timestamps = memoryQueryRateLimit.get(clientKey) || [];
+        timestamps = timestamps.filter((t) => now - t < 60_000);
+        if (timestamps.length >= config.memoryQuery.rateLimitPerMinute) {
+          memoryQueryRateLimit.set(clientKey, timestamps);
+          res.status(429).json({ error: "Rate limit exceeded" });
+          return;
+        }
+        timestamps.push(now);
+        memoryQueryRateLimit.set(clientKey, timestamps);
+
+        const body = req.body || {};
+        const query = typeof body.query === "string" ? body.query.trim() : "";
+        if (!query) {
+          res.status(400).json({ error: "query is required" });
+          return;
+        }
+
+        const result = learningSyncMgr.search({
+          query,
+          date: typeof body.date === "string" ? body.date : undefined,
+          filePattern: typeof body.filePattern === "string" ? body.filePattern : undefined,
+          maxResults: Math.min(
+            typeof body.maxResults === "number" ? body.maxResults : config.memoryQuery.maxResults,
+            config.memoryQuery.maxResults,
+          ),
+          maxTotalChars: config.memoryQuery.maxTotalChars,
+          knownHashes: Array.isArray(body.knownHashes)
+            ? body.knownHashes.filter((h: unknown) => typeof h === "string")
+            : undefined,
+        });
+
+        void audit.record({
+          ts: new Date().toISOString(),
+          action: "memory_query",
+          detail: `query="${query}" matches=${result.totalFound} returned=${result.matches.length} truncated=${result.truncated}`,
+          ok: true,
+        });
+
+        const response: MemoryQueryResponse = {
+          instanceName: config.learningSync.instanceName,
+          matches: result.matches,
+          totalFound: result.totalFound,
+          truncated: result.truncated,
+        };
+
+        res.json(response);
+      });
+    }
+
     // STATUS.md read endpoint — lets any peer fetch current project status
     app.get("/a2a/status", (_req, res) => {
       const statusPath = path.resolve(
@@ -772,6 +850,41 @@ const plugin = {
             }
           }
 
+          // 5. Push-then-pull: re-check diverged files and pull back the
+          //    remote's merged result so both sides converge in one cycle.
+          if (filesToPush.size > 0) {
+            try {
+              const reManifestRes = await fetch(`${peerBase}/a2a/learning-sync/manifest`, {
+                headers: authHeaders,
+                signal: AbortSignal.timeout(15_000),
+              });
+              if (reManifestRes.ok) {
+                const reData = await reManifestRes.json() as { instanceName?: string; mergeVersion?: number; manifest?: MemoryFileEntry[] };
+                const reManifest = reData.manifest || [];
+                const reDiff = learningSyncMgr.diffManifest(reManifest);
+                for (const fileName of reDiff.toFetch) {
+                  if (!filesToPush.has(fileName)) continue; // only re-pull files we just pushed
+                  const reFetchRes = await fetch(`${peerBase}/a2a/learning-sync/fetch`, {
+                    method: "POST",
+                    headers: { ...authHeaders, "content-type": "application/json" },
+                    body: JSON.stringify({ name: fileName }),
+                    signal: AbortSignal.timeout(15_000),
+                  });
+                  if (reFetchRes.ok) {
+                    const reFileData = await reFetchRes.json() as { name: string; content: string };
+                    if (reFileData.content) {
+                      const reMerge = learningSyncMgr.receiveFile(fileName, reFileData.content, reData.instanceName || peer.name, reData.mergeVersion);
+                      if (reMerge.action !== "unchanged") fetched++;
+                      conflicts += reMerge.conflicts;
+                    }
+                  }
+                }
+              }
+            } catch (_pullbackErr) {
+              // Non-fatal: next cycle will converge
+            }
+          }
+
           results.push({ peer: peer.name, fetched, sent, conflicts });
           void audit.record({
             ts: new Date().toISOString(),
@@ -859,6 +972,95 @@ const plugin = {
         return;
       }
       respond(true, { delegations: delegationMgr.listAll() });
+    });
+
+    // ------------------------------------------------------------------
+    // Memory Query gateway methods (Phase 3)
+    // ------------------------------------------------------------------
+
+    api.registerGatewayMethod("a2a.memory.search", ({ params, respond }) => {
+      if (!learningSyncMgr) {
+        respond(false, { error: "learningSync is not enabled" });
+        return;
+      }
+      const payload = asObject(params);
+      const query = asString(payload.query, "").trim();
+      if (!query) {
+        respond(false, { error: "query is required" });
+        return;
+      }
+
+      const result = learningSyncMgr.search({
+        query,
+        date: asString(payload.date, "") || undefined,
+        filePattern: asString(payload.filePattern, "") || undefined,
+        maxResults: payload.maxResults ? asNumber(payload.maxResults, 10) : undefined,
+        maxTotalChars: config.memoryQuery.maxTotalChars,
+      });
+
+      respond(true, {
+        instanceName: config.learningSync.instanceName,
+        ...result,
+      });
+    });
+
+    api.registerGatewayMethod("a2a.memory.query", ({ params, respond }) => {
+      if (!learningSyncMgr) {
+        respond(false, { error: "learningSync is not enabled" });
+        return;
+      }
+      const payload = asObject(params);
+      const peerName = asString(payload.peer, "");
+      const query = asString(payload.query, "").trim();
+      if (!peerName || !query) {
+        respond(false, { error: "peer and query are required" });
+        return;
+      }
+
+      const peer = config.peers.find((p) => p.name === peerName);
+      if (!peer) {
+        respond(false, { error: `Peer not found: ${peerName}` });
+        return;
+      }
+
+      if (!peerHealth.isAvailable(peerName)) {
+        respond(false, { error: `Peer "${peerName}" is unavailable (circuit breaker open)` });
+        return;
+      }
+
+      const request: MemoryQueryRequest = {
+        query,
+        date: asString(payload.date, "") || undefined,
+        filePattern: asString(payload.filePattern, "") || undefined,
+        maxResults: payload.maxResults ? asNumber(payload.maxResults, 10) : undefined,
+      };
+
+      if (config.memoryQuery.deduplicateSyncedWithinSeconds > 0) {
+        const manifest = learningSyncMgr.getManifest();
+        request.knownHashes = manifest.map((e) => e.hash);
+      }
+
+      client.queryMemory(peer, request)
+        .then((result) => {
+          if (result.ok && result.response) {
+            void audit.record({
+              ts: new Date().toISOString(),
+              action: "memory_query_remote",
+              peer: peerName,
+              detail: `query="${query}" matches=${result.response.totalFound} returned=${result.response.matches.length}`,
+              ok: true,
+            });
+            peerHealth.recordSuccess(peerName);
+            respond(true, result.response);
+          } else {
+            peerHealth.recordFailure(peerName);
+            respond(false, { error: result.error || "Query failed" });
+          }
+        })
+        .catch((err) => {
+          peerHealth.recordFailure(peerName);
+          respond(false, { error: String(err) });
+        });
     });
 
     api.registerGatewayMethod("a2a.send", ({ params, respond }) => {
@@ -1085,6 +1287,78 @@ const plugin = {
           return {
             content: [{ type: "text" as const, text: summary }],
             details: { ok, ...result },
+          };
+        },
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // Agent tool: a2a_memory_query
+    // Lets the agent search a peer's memory for relevant information.
+    // ------------------------------------------------------------------
+    if (api.registerTool && learningSyncMgr && config.memoryQuery.enabled) {
+      const memoryQueryParams = {
+        type: "object" as const,
+        required: ["peer", "query"],
+        properties: {
+          peer: { type: "string" as const, description: "Name of the target peer to query memory from" },
+          query: { type: "string" as const, description: "Search query (keywords, date references, topic names)" },
+          date: { type: "string" as const, description: "Optional: filter by date (YYYY-MM-DD format)" },
+          filePattern: { type: "string" as const, description: "Optional: filter by file pattern (e.g. '2026-03-*')" },
+          maxResults: { type: "number" as const, description: "Max results to return (default 10)" },
+        },
+      };
+
+      api.registerTool({
+        name: "a2a_memory_query",
+        description: "Search a peer agent's memory for relevant information. " +
+          "Use this when you need to find what the other agent has learned or remembered about a topic. " +
+          "For simple keyword searches. For complex reasoning queries, use a2a_delegate instead.",
+        label: "A2A Memory Query",
+        parameters: memoryQueryParams,
+        async execute(_toolCallId, params) {
+          const peer = config.peers.find((p) => p.name === params.peer);
+          if (!peer) {
+            const available = config.peers.map((p) => p.name).join(", ") || "(none)";
+            return {
+              content: [{ type: "text" as const, text: `Peer not found: "${params.peer}". Available peers: ${available}` }],
+              details: { ok: false },
+            };
+          }
+
+          const request: MemoryQueryRequest = {
+            query: params.query,
+            date: params.date || undefined,
+            filePattern: params.filePattern || undefined,
+            maxResults: params.maxResults || undefined,
+          };
+
+          const result = await client.queryMemory(peer, request);
+
+          if (!result.ok || !result.response) {
+            return {
+              content: [{ type: "text" as const, text: `Memory query failed: ${result.error}` }],
+              details: { ok: false, error: result.error },
+            };
+          }
+
+          const resp = result.response;
+          if (resp.matches.length === 0) {
+            return {
+              content: [{ type: "text" as const, text: `No memory matches found on ${params.peer} for query: "${params.query}"` }],
+              details: { ok: true, totalFound: 0 },
+            };
+          }
+
+          const formatted = resp.matches.map((m, i) =>
+            `### Match ${i + 1} (score: ${m.score.toFixed(2)}) — ${m.fileName}\n${m.sectionHeader}\n${m.snippet}`
+          ).join("\n\n---\n\n");
+
+          const summary = `Found ${resp.totalFound} matches on ${resp.instanceName}, showing ${resp.matches.length}${resp.truncated ? " (truncated)" : ""}:\n\n${formatted}`;
+
+          return {
+            content: [{ type: "text" as const, text: summary }],
+            details: { ok: true, ...resp },
           };
         },
       });
