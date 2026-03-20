@@ -7,6 +7,7 @@
  */
 
 import type { Server } from "node:http";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -775,6 +776,12 @@ const plugin = {
 
       for (const peer of config.peers) {
         try {
+          // Skip peer if circuit breaker is open
+          if (!peerHealth.isAvailable(peer.name)) {
+            results.push({ peer: peer.name, fetched: 0, sent: 0, conflicts: 0, error: "skipped: circuit breaker open" });
+            continue;
+          }
+
           const peerBase = new URL(peer.agentCardUrl).origin;
           const authHeaders: Record<string, string> = {};
           if (peer.auth?.token) {
@@ -791,6 +798,7 @@ const plugin = {
             signal: AbortSignal.timeout(15_000),
           });
           if (!manifestRes.ok) {
+            peerHealth.recordFailure(peer.name);
             results.push({ peer: peer.name, fetched: 0, sent: 0, conflicts: 0, error: `manifest HTTP ${manifestRes.status}` });
             continue;
           }
@@ -850,41 +858,8 @@ const plugin = {
             }
           }
 
-          // 5. Push-then-pull: re-check diverged files and pull back the
-          //    remote's merged result so both sides converge in one cycle.
-          if (filesToPush.size > 0) {
-            try {
-              const reManifestRes = await fetch(`${peerBase}/a2a/learning-sync/manifest`, {
-                headers: authHeaders,
-                signal: AbortSignal.timeout(15_000),
-              });
-              if (reManifestRes.ok) {
-                const reData = await reManifestRes.json() as { instanceName?: string; mergeVersion?: number; manifest?: MemoryFileEntry[] };
-                const reManifest = reData.manifest || [];
-                const reDiff = learningSyncMgr.diffManifest(reManifest);
-                for (const fileName of reDiff.toFetch) {
-                  if (!filesToPush.has(fileName)) continue; // only re-pull files we just pushed
-                  const reFetchRes = await fetch(`${peerBase}/a2a/learning-sync/fetch`, {
-                    method: "POST",
-                    headers: { ...authHeaders, "content-type": "application/json" },
-                    body: JSON.stringify({ name: fileName }),
-                    signal: AbortSignal.timeout(15_000),
-                  });
-                  if (reFetchRes.ok) {
-                    const reFileData = await reFetchRes.json() as { name: string; content: string };
-                    if (reFileData.content) {
-                      const reMerge = learningSyncMgr.receiveFile(fileName, reFileData.content, reData.instanceName || peer.name, reData.mergeVersion);
-                      if (reMerge.action !== "unchanged") fetched++;
-                      conflicts += reMerge.conflicts;
-                    }
-                  }
-                }
-              }
-            } catch (_pullbackErr) {
-              // Non-fatal: next cycle will converge
-            }
-          }
 
+          peerHealth.recordSuccess(peer.name);
           results.push({ peer: peer.name, fetched, sent, conflicts });
           void audit.record({
             ts: new Date().toISOString(),
@@ -894,6 +869,7 @@ const plugin = {
             detail: `fetched=${fetched} sent=${sent} conflicts=${conflicts}`,
           });
         } catch (err) {
+          peerHealth.recordFailure(peer.name);
           results.push({ peer: peer.name, fetched: 0, sent: 0, conflicts: 0, error: String(err) });
         }
       }
@@ -1362,6 +1338,94 @@ const plugin = {
           };
         },
       });
+    }
+
+    // ------------------------------------------------------------------
+    // Agent tool: browse
+    // Lets the agent control a headless Chrome browser via agent-browser.
+    // Chrome runs as a systemd service (chrome-cdp) with CDP on port 9222.
+    // ------------------------------------------------------------------
+    if (api.registerTool) {
+      const browseParams = {
+        type: "object" as const,
+        required: ["command"],
+        properties: {
+          command: {
+            type: "string" as const,
+            description: [
+              "The browse command to execute. Examples:",
+              '  open https://example.com  — Navigate to URL',
+              '  snapshot                  — Get page text content (accessibility tree)',
+              '  snapshot -i               — Get only interactive elements with @ref IDs',
+              '  click @e5                 — Click element by ref',
+              '  find text "Success Plan" click — Find text and click it',
+              '  eval "document.title"     — Run JavaScript',
+              '  get url                   — Get current page URL',
+              '  screenshot                — Take screenshot',
+              '  status                    — Check Chrome CDP status',
+              '  restart                   — Restart Chrome + daemon',
+            ].join("\n"),
+          },
+        },
+      };
+
+      api.registerTool({
+        name: "browse",
+        description:
+          "Control a headless Chrome browser on this VM. " +
+          "Use this to navigate websites, take snapshots, click elements, and interact with web pages. " +
+          "The browser has persistent login sessions (cookies preserved across restarts). " +
+          "Workflow: open URL → snapshot -i (get interactive elements) → click @ref → snapshot again.",
+        label: "Browse Web",
+        parameters: browseParams,
+        async execute(_toolCallId, params) {
+          const command = (params.command || "").trim();
+          if (!command) {
+            return {
+              content: [{ type: "text" as const, text: "Error: command is required" }],
+              details: { ok: false },
+            };
+          }
+
+          // Allowlisted subcommands to prevent arbitrary shell execution
+          const allowed = [
+            "open", "snapshot", "click", "find", "eval", "get",
+            "screenshot", "status", "restart", "scroll", "wait",
+            "type", "fill", "press", "hover", "back", "forward", "reload",
+          ];
+          const sub = command.split(/\s+/)[0];
+          if (!allowed.includes(sub)) {
+            return {
+              content: [{ type: "text" as const, text: `Denied: "${sub}" is not an allowed browse subcommand. Allowed: ${allowed.join(", ")}` }],
+              details: { ok: false },
+            };
+          }
+
+          return new Promise((resolve) => {
+            // Use shell to handle the browse wrapper correctly
+            execFile("/bin/bash", ["-c", `/usr/local/bin/browse ${command}`], {
+              timeout: 120_000,
+              maxBuffer: 1024 * 1024,
+              env: { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" },
+            }, (err, stdout, stderr) => {
+              const output = (stdout || "").trim();
+              const errMsg = (stderr || "").trim();
+              const text = output || errMsg || (err ? err.message : "(no output)");
+
+              // open command may timeout due to SPA iframes — that's OK
+              const isOpenTimeout = sub === "open" && err?.message?.includes("timeout");
+              const ok = !err || isOpenTimeout;
+
+              resolve({
+                content: [{ type: "text" as const, text }],
+                details: { ok, subcommand: sub },
+              });
+            });
+          });
+        },
+      });
+
+      api.logger.info("a2a-gateway: browse tool registered");
     }
 
     // ------------------------------------------------------------------
