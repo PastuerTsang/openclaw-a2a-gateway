@@ -913,6 +913,37 @@ export class OpenClawAgentExecutor implements AgentExecutor {
       eventBus.publish(heartbeatTask);
     }, STREAMING_HEARTBEAT_INTERVAL_MS);
 
+    // ------------------------------------------------------------------
+    // Browse shortcut: if the delegation message requests browse commands,
+    // execute them directly via /usr/local/bin/browse instead of routing
+    // through the agent LLM (which cannot see plugin-registered tools).
+    // ------------------------------------------------------------------
+    const browseResult = await this.tryBrowseShortcut(requestContext.userMessage);
+    if (browseResult) {
+      clearInterval(heartbeat);
+      const browseMessage: Message = {
+        kind: "message",
+        messageId: uuidv4(),
+        role: "agent",
+        parts: [{ kind: "text", text: browseResult }],
+        contextId,
+      };
+      const browseTask: Task = {
+        kind: "task",
+        id: taskId,
+        contextId,
+        status: {
+          state: "completed",
+          message: browseMessage,
+          timestamp: new Date().toISOString(),
+        },
+        history: [...existingHistory, browseMessage],
+      };
+      eventBus.publish(browseTask);
+      eventBus.finished();
+      return;
+    }
+
     try {
       agentResponse = await this.dispatchViaGatewayRpc(agentId, requestContext.userMessage, contextId);
     } catch (err: unknown) {
@@ -1209,5 +1240,94 @@ export class OpenClawAgentExecutor implements AgentExecutor {
       const message = error instanceof Error ? error.message : String(error);
       this.api.logger.warn(`a2a-gateway: hooks/wake fallback failed (${message})`);
     }
+  }
+
+  /**
+   * If the delegation message contains browse commands, execute them directly
+   * via /usr/local/bin/browse and return the combined output.
+   * Returns null if the message is not a browse task.
+   */
+  private async tryBrowseShortcut(userMessage: unknown): Promise<string | null> {
+    const msg = asObject(userMessage);
+    if (!msg) return null;
+
+    // Extract text from message parts
+    const parts = Array.isArray(msg.parts) ? msg.parts : [];
+    const text = parts
+      .filter((p: Record<string, unknown>) => p.kind === "text" || p.type === "text")
+      .map((p: Record<string, unknown>) => String(p.text || ""))
+      .join("\n");
+
+    if (!text) return null;
+
+    // Check if this is a browse-related task
+    const isBrowseTask = /\bbrowse\b/i.test(text) &&
+      /\b(snapshot|open|click|eval|get url|mastermind|mindfulness)\b/i.test(text);
+    if (!isBrowseTask) return null;
+
+    this.api.logger.info("a2a-gateway: browse shortcut activated");
+
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+
+    const results: string[] = [];
+
+    // Determine browse commands to run based on message content
+    const isMastermind = /mastermind/i.test(text);
+    const isSuccessPlan = /success.?plan/i.test(text);
+
+    try {
+      // Step 1: Check current page
+      const { stdout: urlOut } = await execFileAsync("/usr/local/bin/browse", ["get", "url"], {
+        timeout: 30_000,
+        env: { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" },
+      });
+      const currentUrl = urlOut.trim();
+      results.push(`Current URL: ${currentUrl}`);
+
+      // Step 2: If mastermind success plan requested and not already there, navigate
+      if (isMastermind && isSuccessPlan && !currentUrl.includes("success_plan")) {
+        // Navigate to dashboard first
+        try {
+          await execFileAsync("/usr/local/bin/browse", ["open", "https://app.mastermind.com/account/home"], {
+            timeout: 60_000,
+            env: { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" },
+          });
+        } catch {
+          // open may timeout due to SPA, that's OK
+        }
+
+        // Click Success Plan via site navigation
+        await execFileAsync("/usr/local/bin/browse", ["eval", "document.querySelector('a[href*=\"business_plan\"]').click()"], {
+          timeout: 30_000,
+          env: { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" },
+        });
+
+        // Wait for navigation
+        await new Promise(r => setTimeout(r, 3000));
+      }
+
+      // Step 3: Take snapshot
+      const { stdout: snapshotOut } = await execFileAsync("/usr/local/bin/browse", ["snapshot", "-i"], {
+        timeout: 30_000,
+        maxBuffer: 1024 * 1024,
+        env: { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" },
+      });
+      results.push(snapshotOut.trim());
+
+      // Step 4: Verify URL
+      const { stdout: finalUrl } = await execFileAsync("/usr/local/bin/browse", ["get", "url"], {
+        timeout: 15_000,
+        env: { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" },
+      });
+      results.push(`Final URL: ${finalUrl.trim()}`);
+
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      results.push(`Browse error: ${errMsg}`);
+    }
+
+    return results.join("\n\n");
   }
 }
