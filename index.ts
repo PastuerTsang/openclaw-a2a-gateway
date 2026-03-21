@@ -1459,6 +1459,7 @@ const plugin = {
             "- Use other available tools (calendar, web search, file access, etc.) as needed.",
             "- Reply in the SAME LANGUAGE as the task message.",
             "- Be concise and action-oriented. Return the result, not meta-commentary.",
+            "- When using the `browse` tool, return the RAW snapshot output directly to the caller. Do NOT summarize, interpret, or add your own analysis. The caller needs the original page content to do their own analysis.",
             "- Do NOT reference previous conversations, sessions, or attempts.",
             "- If you cannot complete the task, explain why clearly.",
             "",
