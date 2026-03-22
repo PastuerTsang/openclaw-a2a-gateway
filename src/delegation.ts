@@ -363,6 +363,21 @@ function extractTaskResult(task: Record<string, unknown>): { text?: string; data
     }
   }
 
+  // Check status.message (primary location for browse shortcut and sync responses)
+  const status = task.status as Record<string, unknown> | undefined;
+  if (!result.text && status) {
+    const statusMsg = status.message as Record<string, unknown> | undefined;
+    if (statusMsg) {
+      const parts = statusMsg.parts as Array<Record<string, unknown>> | undefined;
+      if (Array.isArray(parts)) {
+        const textParts = parts.filter((p) => (p.kind === "text" || p.type === "text") && typeof p.text === "string");
+        if (textParts.length > 0) {
+          result.text = textParts.map((p) => p.text).join("\n");
+        }
+      }
+    }
+  }
+
   // Also check history for the last agent message
   const history = task.history as Array<Record<string, unknown>> | undefined;
   if (!result.text && Array.isArray(history)) {
@@ -399,6 +414,21 @@ function extractTextFromResponse(response: Record<string, unknown> | undefined):
   if (!response) return "";
   // Try common patterns
   const result = (response.result || response) as Record<string, unknown>;
+
+  // Check status.message first (most reliable for completed tasks)
+  const status = result.status as Record<string, unknown> | undefined;
+  if (status) {
+    const statusMsg = status.message as Record<string, unknown> | undefined;
+    if (statusMsg) {
+      const parts = statusMsg.parts as Array<Record<string, unknown>> | undefined;
+      if (Array.isArray(parts)) {
+        const textParts = parts.filter((p) => (p.kind === "text" || p.type === "text") && typeof p.text === "string");
+        if (textParts.length > 0) return textParts.map((p) => p.text).join("\n");
+      }
+    }
+  }
+
+  // Fallback to history
   const history = result.history as Array<Record<string, unknown>> | undefined;
   if (Array.isArray(history)) {
     for (let i = history.length - 1; i >= 0; i--) {

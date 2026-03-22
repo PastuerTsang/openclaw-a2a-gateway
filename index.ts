@@ -639,6 +639,60 @@ const plugin = {
       }
     });
 
+    // ------------------------------------------------------------------
+    // Browse endpoint — direct browser control, bypasses agent LLM
+    // POST /a2a/browse { command: "snapshot -i" }
+    // ------------------------------------------------------------------
+    app.post("/a2a/browse", express.json(), async (req, res) => {
+      // Auth check
+      if (config.security.inboundAuth === "bearer" && acceptedTokens.size > 0) {
+        const authHeader = req.headers.authorization;
+        if (!validateBearerToken(authHeader)) {
+          res.status(401).json({ error: "Unauthorized" });
+          return;
+        }
+      }
+
+      const command = (req.body?.command || "").trim();
+      if (!command) {
+        res.status(400).json({ error: "command is required" });
+        return;
+      }
+
+      const allowed = [
+        "open", "snapshot", "click", "find", "eval", "get",
+        "screenshot", "status", "restart", "scroll", "wait",
+        "type", "fill", "press", "hover", "back", "forward", "reload",
+      ];
+      const sub = command.split(/\s+/)[0];
+      if (!allowed.includes(sub)) {
+        res.status(400).json({ error: `Denied: "${sub}" not allowed. Allowed: ${allowed.join(", ")}` });
+        return;
+      }
+
+      try {
+        const { stdout, stderr } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+          execFile("/bin/bash", ["-c", `/usr/local/bin/browse ${command}`], {
+            timeout: 120_000,
+            maxBuffer: 2 * 1024 * 1024,
+            env: { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" },
+          }, (err, stdout, stderr) => {
+            if (err && sub !== "open") {
+              reject(err);
+            } else {
+              resolve({ stdout: stdout || "", stderr: stderr || "" });
+            }
+          });
+        });
+        res.json({ ok: true, output: stdout.trim() || stderr.trim() });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        res.json({ ok: false, error: msg });
+      }
+    });
+
+    api.logger.info("a2a-gateway: /a2a/browse endpoint registered");
+
     if (config.observability.exposeMetricsEndpoint) {
       app.get(
         config.observability.metricsPath,

@@ -918,6 +918,17 @@ export class OpenClawAgentExecutor implements AgentExecutor {
     // execute them directly via /usr/local/bin/browse instead of routing
     // through the agent LLM (which cannot see plugin-registered tools).
     // ------------------------------------------------------------------
+    // Debug: log the userMessage structure to understand format
+    const _msgDebug = requestContext.userMessage as unknown;
+    const _msgObj = _msgDebug as Record<string, unknown> | undefined;
+    const _msgText = typeof _msgDebug === "string" ? _msgDebug
+      : _msgObj && Array.isArray(_msgObj.parts)
+        ? (_msgObj.parts as Array<Record<string, unknown>>)
+            .filter(p => p.kind === "text" || p.type === "text")
+            .map(p => String(p.text || "")).join(" ")
+        : JSON.stringify(_msgDebug).slice(0, 200);
+    this.api.logger.info(`a2a-gateway: browse-check message text: ${String(_msgText).slice(0, 200)}`);
+
     const browseResult = await this.tryBrowseShortcut(requestContext.userMessage);
     if (browseResult) {
       clearInterval(heartbeat);
@@ -1247,11 +1258,40 @@ export class OpenClawAgentExecutor implements AgentExecutor {
    * via /usr/local/bin/browse and return the combined output.
    * Returns null if the message is not a browse task.
    */
+  // ---------------------------------------------------------------------------
+  // Browse shortcut — deterministic browse execution for delegated tasks.
+  //
+  // Design principles:
+  //   1. Every task MUST extract an explicit target URL from the message.
+  //   2. Every task MUST force-navigate to the target URL before acting.
+  //   3. Tab hygiene: close stray tabs, keep only 1 working tab.
+  //   4. After task: navigate back to a canonical landing page.
+  //   5. Parse explicit browse commands from the message (no regex guessing).
+  // ---------------------------------------------------------------------------
+
+  /** Canonical landing pages for known member sites. */
+  private static readonly CANONICAL_PAGES: Record<string, string> = {
+    "mastermind.com": "https://app.mastermind.com/account/home",
+    "app.mastermind.com": "https://app.mastermind.com/account/home",
+    "mindfulnessexercises.com": "https://members.mindfulnessexercises.com/dashboard/",
+    "members.mindfulnessexercises.com": "https://members.mindfulnessexercises.com/dashboard/",
+  };
+
+  /** SPA sites that require in-app navigation instead of direct URL access. */
+  private static readonly SPA_NAVIGATION: Record<string, { entryUrl: string; routes: Record<string, string> }> = {
+    "app.mastermind.com": {
+      entryUrl: "https://app.mastermind.com/account/home",
+      routes: {
+        "success_plan": "document.querySelector('a[href*=\"business_plan\"]').click()",
+        "business_plan": "document.querySelector('a[href*=\"business_plan\"]').click()",
+      },
+    },
+  };
+
   private async tryBrowseShortcut(userMessage: unknown): Promise<string | null> {
     const msg = asObject(userMessage);
     if (!msg) return null;
 
-    // Extract text from message parts
     const parts = Array.isArray(msg.parts) ? msg.parts : [];
     const text = parts
       .filter((p: Record<string, unknown>) => p.kind === "text" || p.type === "text")
@@ -1260,9 +1300,9 @@ export class OpenClawAgentExecutor implements AgentExecutor {
 
     if (!text) return null;
 
-    // Check if this is a browse-related task
+    // Activation: must mention "browse" + a browse subcommand or known site
     const isBrowseTask = /\bbrowse\b/i.test(text) &&
-      /\b(snapshot|open|click|eval|get url|mastermind|mindfulness)\b/i.test(text);
+      /\b(snapshot|open|click|eval|get\s*url|status|mastermind|mindfulness)\b/i.test(text);
     if (!isBrowseTask) return null;
 
     this.api.logger.info("a2a-gateway: browse shortcut activated");
@@ -1271,57 +1311,125 @@ export class OpenClawAgentExecutor implements AgentExecutor {
     const { promisify } = await import("node:util");
     const execFileAsync = promisify(execFile);
 
+    const browseEnv = { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" };
+    const browseExec = async (args: string[], timeout = 30_000, maxBuf = 1024 * 1024): Promise<string> => {
+      const { stdout } = await execFileAsync("/usr/local/bin/browse", args, {
+        timeout,
+        maxBuffer: maxBuf,
+        env: browseEnv,
+      });
+      return (stdout || "").trim();
+    };
+    const browseExecSafe = async (args: string[], timeout = 30_000): Promise<string> => {
+      try { return await browseExec(args, timeout); } catch { return ""; }
+    };
+
     const results: string[] = [];
 
-    // Determine browse commands to run based on message content
-    const isMastermind = /mastermind/i.test(text);
-    const isSuccessPlan = /success.?plan/i.test(text);
-
     try {
-      // Step 1: Check current page
-      const { stdout: urlOut } = await execFileAsync("/usr/local/bin/browse", ["get", "url"], {
-        timeout: 30_000,
-        env: { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" },
-      });
-      const currentUrl = urlOut.trim();
-      results.push(`Current URL: ${currentUrl}`);
-
-      // Step 2: If mastermind success plan requested and not already there, navigate
-      if (isMastermind && isSuccessPlan && !currentUrl.includes("success_plan")) {
-        // Navigate to dashboard first
-        try {
-          await execFileAsync("/usr/local/bin/browse", ["open", "https://app.mastermind.com/account/home"], {
-            timeout: 60_000,
-            env: { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" },
-          });
-        } catch {
-          // open may timeout due to SPA, that's OK
+      // ── Phase 1: Tab hygiene ──────────────────────────────────────────
+      // Close all stray tabs, keep only tab 0.
+      const tabListRaw = await browseExecSafe(["tab", "list"]);
+      const tabLines = tabListRaw.split("\n").filter(l => /\[\d+\]/.test(l));
+      if (tabLines.length > 1) {
+        // Close from highest index down to keep tab 0
+        for (let i = tabLines.length - 1; i > 0; i--) {
+          await browseExecSafe(["tab", String(i)]);
+          await browseExecSafe(["tab", "close"]);
         }
-
-        // Click Success Plan via site navigation
-        await execFileAsync("/usr/local/bin/browse", ["eval", "document.querySelector('a[href*=\"business_plan\"]').click()"], {
-          timeout: 30_000,
-          env: { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" },
-        });
-
-        // Wait for navigation
-        await new Promise(r => setTimeout(r, 3000));
+        await browseExecSafe(["tab", "0"]);
+        this.api.logger.info(`a2a-gateway: browse cleanup — closed ${tabLines.length - 1} stray tab(s)`);
       }
 
-      // Step 3: Take snapshot
-      const { stdout: snapshotOut } = await execFileAsync("/usr/local/bin/browse", ["snapshot", "-i"], {
-        timeout: 30_000,
-        maxBuffer: 1024 * 1024,
-        env: { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" },
-      });
-      results.push(snapshotOut.trim());
+      // ── Phase 2: Extract target URL ───────────────────────────────────
+      // Try explicit URL in message first
+      const urlMatch = text.match(/\bopen\s+(https?:\/\/[^\s,)]+)/i)
+        || text.match(/(https?:\/\/[^\s,)]+)/);
+      // Fall back to known-site keyword detection
+      let targetUrl: string | null = urlMatch ? urlMatch[1] : null;
 
-      // Step 4: Verify URL
-      const { stdout: finalUrl } = await execFileAsync("/usr/local/bin/browse", ["get", "url"], {
-        timeout: 15_000,
-        env: { ...process.env, HOME: "/home/ai-agent", DISPLAY: ":1" },
-      });
-      results.push(`Final URL: ${finalUrl.trim()}`);
+      if (!targetUrl) {
+        if (/mastermind/i.test(text)) {
+          targetUrl = "https://app.mastermind.com/account/home";
+        } else if (/mindfulness/i.test(text)) {
+          targetUrl = "https://members.mindfulnessexercises.com/dashboard/";
+        }
+      }
+
+      // ── Phase 3: Navigate to target ───────────────────────────────────
+      const beforeUrl = await browseExec(["get", "url"]);
+      results.push(`Before URL: ${beforeUrl}`);
+
+      if (targetUrl) {
+        const targetHost = (() => { try { return new URL(targetUrl).hostname; } catch { return ""; } })();
+        const spaConfig = OpenClawAgentExecutor.SPA_NAVIGATION[targetHost];
+
+        if (spaConfig) {
+          // SPA site: navigate via entry URL + in-app click
+          const targetPath = (() => { try { return new URL(targetUrl).pathname; } catch { return ""; } })();
+          const routeKey = Object.keys(spaConfig.routes).find(k => targetPath.includes(k));
+
+          // Always start from the SPA entry point
+          if (!beforeUrl.includes(targetHost)) {
+            await browseExecSafe(["open", spaConfig.entryUrl], 60_000);
+            await new Promise(r => setTimeout(r, 2000));
+          }
+
+          if (routeKey) {
+            // Use in-app navigation
+            await browseExecSafe(["eval", spaConfig.routes[routeKey]]);
+            await new Promise(r => setTimeout(r, 3000));
+          } else if (!beforeUrl.includes(targetHost)) {
+            // No specific route — just land on entry URL (already done above)
+          }
+        } else {
+          // Normal site: direct open
+          await browseExecSafe(["open", targetUrl], 60_000);
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      }
+
+      // Verify we're on the right page
+      const afterNavUrl = await browseExec(["get", "url"]);
+      if (targetUrl) {
+        const targetHost = (() => { try { return new URL(targetUrl).hostname; } catch { return ""; } })();
+        if (targetHost && !afterNavUrl.includes(targetHost)) {
+          results.push(`WARNING: Navigation may have failed. Expected host ${targetHost}, got: ${afterNavUrl}`);
+        }
+      }
+
+      // ── Phase 4: Execute requested browse commands ────────────────────
+      // Extract explicit browse commands from the message
+      const explicitCmds = this.extractBrowseCommands(text);
+
+      if (explicitCmds.length > 0) {
+        for (const cmd of explicitCmds) {
+          const cmdParts = cmd.split(/\s+/);
+          try {
+            const output = await browseExec(cmdParts, 60_000);
+            results.push(output);
+          } catch (err: unknown) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            results.push(`Command "${cmd}" error: ${errMsg}`);
+          }
+        }
+      } else {
+        // Default: take interactive snapshot
+        const snapshot = await browseExec(["snapshot", "-i"], 30_000);
+        results.push(snapshot);
+      }
+
+      // ── Phase 5: Record final URL ─────────────────────────────────────
+      const finalUrl = await browseExec(["get", "url"]);
+      results.push(`Final URL: ${finalUrl}`);
+
+      // ── Phase 6: Post-task cleanup — return to canonical page ─────────
+      const finalHost = (() => { try { return new URL(finalUrl).hostname; } catch { return ""; } })();
+      const canonical = OpenClawAgentExecutor.CANONICAL_PAGES[finalHost];
+      if (canonical && finalUrl !== canonical) {
+        await browseExecSafe(["open", canonical], 60_000);
+        this.api.logger.info(`a2a-gateway: browse cleanup — returned to canonical page ${canonical}`);
+      }
 
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -1329,5 +1437,43 @@ export class OpenClawAgentExecutor implements AgentExecutor {
     }
 
     return results.join("\n\n");
+  }
+
+  /**
+   * Extract explicit browse subcommands from a delegation message.
+   * Recognizes patterns like:
+   *   "browse snapshot -i"
+   *   "執行 snapshot -i"
+   *   "run: open https://example.com"
+   *   "browse open URL then snapshot"
+   */
+  private extractBrowseCommands(text: string): string[] {
+    const commands: string[] = [];
+    const allowed = new Set([
+      "open", "snapshot", "click", "find", "eval", "get",
+      "screenshot", "status", "restart", "scroll", "wait",
+      "type", "fill", "press", "hover", "back", "forward", "reload",
+    ]);
+
+    // Pattern 1: "browse <cmd> ..."
+    const browseRe = /\bbrowse\s+((?:open|snapshot|click|find|eval|get|screenshot|status|restart|scroll|wait|type|fill|press|hover|back|forward|reload)\b[^\n.。，,]*)/gi;
+    let m;
+    while ((m = browseRe.exec(text)) !== null) {
+      commands.push(m[1].trim());
+    }
+
+    // Pattern 2: "執行 <cmd> ..." or "run: <cmd> ..."
+    const runRe = /(?:執行|run[:\s])\s*((?:open|snapshot|click|find|eval|get|screenshot|scroll|wait)\b[^\n.。，,]*)/gi;
+    while ((m = runRe.exec(text)) !== null) {
+      const cmd = m[1].trim();
+      if (!commands.includes(cmd)) commands.push(cmd);
+    }
+
+    // Deduplicate: if we have "open URL" extracted from both navigate and command, skip
+    // the open since Phase 3 already handles navigation
+    return commands.filter(cmd => {
+      const sub = cmd.split(/\s+/)[0];
+      return allowed.has(sub);
+    });
   }
 }
