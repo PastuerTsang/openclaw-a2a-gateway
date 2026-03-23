@@ -1,5 +1,5 @@
 ---
-lastUpdated: "2026-03-22T11:50:00+00:00"
+lastUpdated: "2026-03-23T14:45:00+00:00"
 updatedBy: "VM-Main"
 ---
 
@@ -19,6 +19,7 @@ updatedBy: "VM-Main"
 
 ## 近期變更
 ### VM-Main
+- 2026-03-23: feat: 自我改進全家桶 — 升級 self-improving-agent v3.0.5、安裝 self-improving/proactive-agent/inner-life(core+reflect+evolve)、self-healing L1-L4（watchdog+healthcheck+AI急救+Telegram/Discord 雙通道告警）
 - 2026-03-22: ops: SSH 硬化完成 — 清理 authorized_keys (8→5)、iptables 限縮 SSH 僅允許 Tailscale、規則持久化
 - 2026-03-19: fix: doLearningSync 加入 circuit breaker 檢查 + peerHealth 記錄，peer 離線時不再無限 retry
 - 2026-03-16: fix: a2a_delegate 測試通過，circuit breaker 重置，Phase 2 確認修復
