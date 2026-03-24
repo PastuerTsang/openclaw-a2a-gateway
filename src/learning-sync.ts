@@ -151,6 +151,12 @@ function extractBlocks(
         currentLines = [];
       }
       currentSource = m[1].toLowerCase();
+    } else if (line.trim() === "" && currentLines.length > 0) {
+      // Blank line acts as a block boundary for untagged content.
+      // This prevents entire section bodies from becoming a single giant
+      // block that defeats normalizeContent-based dedup.
+      blocks.push({ source: currentSource, lines: currentLines });
+      currentLines = [];
     } else {
       currentLines.push(line);
     }
@@ -463,6 +469,16 @@ export class LearningSyncManager {
 
     // Only write if content actually changed
     if (hashContent(mergedContent) === hashContent(localContent)) {
+      return { action: "unchanged", conflicts: 0 };
+    }
+
+    // Safety valve: reject merge if result is unreasonably larger than inputs
+    const maxInputSize = Math.max(localContent.length, content.length);
+    if (mergedContent.length > maxInputSize * 3 && mergedContent.length > 100_000) {
+      this.logger.warn(
+        `merge of ${name} rejected: result ${(mergedContent.length / 1024).toFixed(0)}KB ` +
+        `exceeds 3x largest input ${(maxInputSize / 1024).toFixed(0)}KB — possible dedup failure`,
+      );
       return { action: "unchanged", conflicts: 0 };
     }
 
