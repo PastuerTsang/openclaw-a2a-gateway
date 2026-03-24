@@ -1,5 +1,5 @@
 ---
-lastUpdated: "2026-03-23T14:45:00+00:00"
+lastUpdated: "2026-03-24T15:15:00+00:00"
 updatedBy: "VM-Main"
 ---
 
@@ -19,6 +19,9 @@ updatedBy: "VM-Main"
 
 ## 近期變更
 ### VM-Main
+- 2026-03-24: fix: learning-sync extractBlocks 空行分割修復 memory 膨脹 bug（9.7MB→24KB）+ merge 大小安全閥
+- 2026-03-24: ops: OpenClaw 升級 2026.3.7→2026.3.23-2（VM+手機）、Node 22→24（手機）、自我改進全家桶同步到手機端
+- 2026-03-24: ops: memory-lancedb-pro 載入修復（NODE_PATH）、bootstrap token 優化（TOOLS.md 拆分 + HEARTBEAT.md 精簡）
 - 2026-03-23: feat: 自我改進全家桶 — 升級 self-improving-agent v3.0.5、安裝 self-improving/proactive-agent/inner-life(core+reflect+evolve)、self-healing L1-L4（watchdog+healthcheck+AI急救+Telegram/Discord 雙通道告警）
 - 2026-03-22: ops: SSH 硬化完成 — 清理 authorized_keys (8→5)、iptables 限縮 SSH 僅允許 Tailscale、規則持久化
 - 2026-03-19: fix: doLearningSync 加入 circuit breaker 檢查 + peerHealth 記錄，peer 離線時不再無限 retry
