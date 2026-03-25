@@ -1,5 +1,5 @@
 ---
-lastUpdated: "2026-03-24T15:15:00+00:00"
+lastUpdated: "2026-03-25T23:30:00+00:00"
 updatedBy: "VM-Main"
 ---
 
@@ -19,6 +19,9 @@ updatedBy: "VM-Main"
 
 ## 近期變更
 ### VM-Main
+- 2026-03-25: fix: A2A dispatch 改用 plugin SDK subagent 繞過 operator.write scope 限制（雙向 delegation 測試通過）
+- 2026-03-25: ops: memory-lancedb-pro 升級 beta.5→beta.10 + smart extraction LLM 模型修正 + stringEnum import 修復
+- 2026-03-25: ops: VNC UDP 8444 iptables 規則補齊（僅允許 Tailscale）+ discord-hotfix-guard 清理 + acpx 權限修復
 - 2026-03-24: fix: learning-sync extractBlocks 空行分割修復 memory 膨脹 bug（9.7MB→24KB）+ merge 大小安全閥
 - 2026-03-24: ops: OpenClaw 升級 2026.3.7→2026.3.23-2（VM+手機）、Node 22→24（手機）、自我改進全家桶同步到手機端
 - 2026-03-24: ops: memory-lancedb-pro 載入修復（NODE_PATH）、bootstrap token 優化（TOOLS.md 拆分 + HEARTBEAT.md 精簡）
