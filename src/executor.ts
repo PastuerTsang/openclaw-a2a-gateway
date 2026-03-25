@@ -717,10 +717,10 @@ class GatewayRpcConnection {
       minProtocol: 3,
       maxProtocol: 3,
       client: {
-        id: "cli",
+        id: "gateway-client",
         version: "a2a-gateway-plugin",
         platform: process.platform,
-        mode: "cli",
+        mode: "backend",
         instanceId: uuidv4(),
       },
       role: "operator",
@@ -956,7 +956,7 @@ export class OpenClawAgentExecutor implements AgentExecutor {
     }
 
     try {
-      agentResponse = await this.dispatchViaGatewayRpc(agentId, requestContext.userMessage, contextId);
+      agentResponse = await this.dispatchViaPluginSdk(agentId, requestContext.userMessage, contextId);
     } catch (err: unknown) {
       clearInterval(heartbeat);
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -1067,6 +1067,58 @@ export class OpenClawAgentExecutor implements AgentExecutor {
     }
   }
 
+
+  private async dispatchViaPluginSdk(
+    agentId: string,
+    userMessage: unknown,
+    contextId: string,
+  ): Promise<AgentResponse> {
+    const runtime = (this.api as any).runtime;
+    if (!runtime?.subagent) {
+      this.api.logger.warn("a2a-gateway: plugin SDK subagent not available, falling back to WS RPC");
+      return this.dispatchViaGatewayRpc(agentId, userMessage, contextId);
+    }
+
+    const messageText = extractInboundMessageText(userMessage);
+    const sessionKey = `agent:${agentId}:a2a:${contextId}`;
+
+    const { runId: actualRunId } = await runtime.subagent.run({
+      sessionKey,
+      message: messageText,
+      deliver: false,
+      idempotencyKey: uuidv4(),
+    });
+
+    const waitResult = await runtime.subagent.waitForRun({
+      runId: actualRunId,
+      timeoutMs: this.agentResponseTimeoutMs,
+    });
+
+    if (waitResult.status !== "ok") {
+      throw new Error(waitResult.error || "Subagent run failed");
+    }
+
+    const { messages } = await runtime.subagent.getSessionMessages({
+      sessionKey,
+      limit: 50,
+    });
+
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = (messages[i] as any)?.message ?? messages[i];
+      if (msg?.role !== "assistant") continue;
+      if (Array.isArray(msg.content)) {
+        const texts = msg.content
+          .filter((p: any) => p?.type === "text" && p?.text?.trim())
+          .map((p: any) => p.text);
+        if (texts.length) return { text: texts.join("\n"), mediaUrls: [] };
+      }
+      if (typeof msg.content === "string" && msg.content.trim()) {
+        return { text: msg.content, mediaUrls: [] };
+      }
+    }
+
+    throw new Error("No assistant response from subagent run");
+  }
 
   private async dispatchViaGatewayRpc(
     agentId: string,
