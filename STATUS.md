@@ -1,5 +1,5 @@
 ---
-lastUpdated: "2026-03-26T06:30:00+00:00"
+lastUpdated: "2026-03-27T14:30:00+00:00"
 updatedBy: "VM-Main"
 ---
 
@@ -19,6 +19,7 @@ updatedBy: "VM-Main"
 
 ## 近期變更
 ### VM-Main
+- 2026-03-27: ops: OpenClaw 升級 2026.3.23-2→2026.3.24 + Xvnc 綁定收斂到 Tailscale IP + memory 保護 pre-commit hook + token 明文移除 + ubuntu CLI remote mode 連接 gateway
 - 2026-03-26: fix: 模型切回 gpt-5.4 + memory-reflection hook dedup 修復（根因：框架 broadcast hook 到所有 scope 導致 16x LLM 並發風暴打爆 Codex）
 - 2026-03-26: ops: 模型升級 (gpt-5.4→5.3-codex, gemini-2.0→2.5) + Discord threadBindings/spawnAcpSessions 啟用 + watchdog .env 載入修正 + 多 AI 團隊公司架構規劃中
 - 2026-03-25: fix: A2A dispatch 改用 plugin SDK subagent 繞過 operator.write scope 限制（雙向 delegation 測試通過）
