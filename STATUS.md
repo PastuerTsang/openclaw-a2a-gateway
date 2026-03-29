@@ -1,5 +1,5 @@
 ---
-lastUpdated: "2026-03-27T14:30:00+00:00"
+lastUpdated: "2026-03-29T00:30:00+00:00"
 updatedBy: "VM-Main"
 ---
 
@@ -19,6 +19,7 @@ updatedBy: "VM-Main"
 
 ## 近期變更
 ### VM-Main
+- 2026-03-29: ops: 完整安全盤點 — ip6tables 加最終 REJECT 並持久化 + Oracle Cloud VCN ingress 清理（TCP 22 全刪、TCP 8000 刪除、舊 VCN 刪除）+ 監聽埠全數對照確認安全 + cron thinking 優化（5 個分析型任務改 gpt-5.4 + medium thinking）
 - 2026-03-27: ops: OpenClaw 升級 2026.3.23-2→2026.3.24 + Xvnc 綁定收斂到 Tailscale IP + memory 保護 pre-commit hook + token 明文移除 + ubuntu CLI remote mode 連接 gateway
 - 2026-03-26: fix: 模型切回 gpt-5.4 + memory-reflection hook dedup 修復（根因：框架 broadcast hook 到所有 scope 導致 16x LLM 並發風暴打爆 Codex）
 - 2026-03-26: ops: 模型升級 (gpt-5.4→5.3-codex, gemini-2.0→2.5) + Discord threadBindings/spawnAcpSessions 啟用 + watchdog .env 載入修正 + 多 AI 團隊公司架構規劃中
