@@ -1,6 +1,6 @@
 ---
-lastUpdated: "2026-03-29T00:30:00+00:00"
-updatedBy: "VM-Main"
+lastUpdated: "2026-03-30T15:30:00+00:00"
+updatedBy: "Claude-Code"
 ---
 
 # Claw-to-Claw 專案進度
@@ -19,6 +19,8 @@ updatedBy: "VM-Main"
 
 ## 近期變更
 ### VM-Main
+- 2026-03-30: feat: AI 董事會案件提報系統 MVP v1 上線 — Google Form(7欄)+Sheet(28欄)+Gemini AI 自動處理+systemd timer 每2分鐘掃描 + GOG CLI v0.12.0 安裝授權 + 逾期審計三項落地（交付檢核清單+收尾檢核清單+4施工件）+ daily-health-check 改 gpt-5.4 + Telegram failure alert
+- 2026-03-29: ops: 主動跟進機制上線 — heartbeat 30m 啟用 + SOUL.md Action Loop Rule + 逾期審計 cron (2h/Telegram) + workspace 精簡 68→22 + thinkingDefault off→low
 - 2026-03-29: ops: 完整安全盤點 — ip6tables 加最終 REJECT 並持久化 + Oracle Cloud VCN ingress 清理（TCP 22 全刪、TCP 8000 刪除、舊 VCN 刪除）+ 監聽埠全數對照確認安全 + cron thinking 優化（5 個分析型任務改 gpt-5.4 + medium thinking）
 - 2026-03-27: ops: OpenClaw 升級 2026.3.23-2→2026.3.24 + Xvnc 綁定收斂到 Tailscale IP + memory 保護 pre-commit hook + token 明文移除 + ubuntu CLI remote mode 連接 gateway
 - 2026-03-26: fix: 模型切回 gpt-5.4 + memory-reflection hook dedup 修復（根因：框架 broadcast hook 到所有 scope 導致 16x LLM 並發風暴打爆 Codex）
