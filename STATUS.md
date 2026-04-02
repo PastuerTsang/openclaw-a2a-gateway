@@ -1,6 +1,6 @@
 ---
-lastUpdated: "2026-03-30T15:30:00+00:00"
-updatedBy: "Claude-Code"
+lastUpdated: "2026-04-02T14:30:00+00:00"
+updatedBy: "VM-Main"
 ---
 
 # Claw-to-Claw 專案進度
@@ -19,6 +19,7 @@ updatedBy: "Claude-Code"
 
 ## 近期變更
 ### VM-Main
+- 2026-04-02: feat: workspace 三層記憶架構落地 — decisions/(ADR) + shared/(協作層) + 治理文件分工收斂；補齊 bootstrap-extra-files hook + exec allowlist + approval 關閉；SOUL.md 語言規則 + self-improvement 量化晉升觸發
 - 2026-03-30: feat: AI 董事會案件提報系統 MVP v1 上線 — Google Form(7欄)+Sheet(28欄)+Gemini AI 自動處理+systemd timer 每2分鐘掃描 + GOG CLI v0.12.0 安裝授權 + 逾期審計三項落地（交付檢核清單+收尾檢核清單+4施工件）+ daily-health-check 改 gpt-5.4 + Telegram failure alert
 - 2026-03-29: ops: 主動跟進機制上線 — heartbeat 30m 啟用 + SOUL.md Action Loop Rule + 逾期審計 cron (2h/Telegram) + workspace 精簡 68→22 + thinkingDefault off→low
 - 2026-03-29: ops: 完整安全盤點 — ip6tables 加最終 REJECT 並持久化 + Oracle Cloud VCN ingress 清理（TCP 22 全刪、TCP 8000 刪除、舊 VCN 刪除）+ 監聽埠全數對照確認安全 + cron thinking 優化（5 個分析型任務改 gpt-5.4 + medium thinking）
