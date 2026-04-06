@@ -151,6 +151,12 @@ export interface DelegationConfig {
   pollIntervalMs: number;
   /** Max number of poll attempts before timeout (default 60). */
   maxPollAttempts: number;
+  /** Enable durable SQLite ledger for delegation reliability (default true when delegation is enabled). */
+  ledgerEnabled: boolean;
+  /** Path to the SQLite ledger file (default "data/delegation-ledger.db"). */
+  ledgerPath: string;
+  /** Instance name used as senderNode in task IDs (default hostname). */
+  instanceName: string;
 }
 
 export interface DelegationResult {

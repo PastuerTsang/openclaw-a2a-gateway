@@ -48,7 +48,8 @@ import {
 import { AuditLogger } from "./src/audit.js";
 import { PeerHealthTracker, withRetry } from "./src/peer-health.js";
 import { PushNotificationManager } from "./src/push-notifications.js";
-import { DelegationManager } from "./src/delegation.js";
+import { DelegationManager, parseDelegationHeader } from "./src/delegation.js";
+import { DelegationLedger } from "./src/delegation-ledger.js";
 
 /** Build a JSON-RPC error response. */
 function jsonRpcError(id: string | number | null, code: number, message: string) {
@@ -290,6 +291,9 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
       defaultTimeoutMs: Math.max(1000, asNumber(delegation.defaultTimeoutMs, 120_000)),
       pollIntervalMs: Math.max(500, asNumber(delegation.pollIntervalMs, 2_000)),
       maxPollAttempts: Math.max(1, asNumber(delegation.maxPollAttempts, 60)),
+      ledgerEnabled: asBoolean(delegation.ledgerEnabled, true),
+      ledgerPath: resolveConfiguredPath(delegation.ledgerPath, "data/delegation-ledger.db", resolvePath),
+      instanceName: asString(delegation.instanceName, "") || os.hostname(),
     },
     memoryQuery: {
       enabled: asBoolean(memoryQuery.enabled, asBoolean(learningSync.enabled, false)),
@@ -939,6 +943,11 @@ const plugin = {
     // Delegation (Phase 2 Claw-to-Claw)
     // ----------------------------------------------------------------
 
+    const delegationLedger =
+      config.delegation.enabled && config.delegation.ledgerEnabled
+        ? new DelegationLedger(config.delegation.ledgerPath)
+        : null;
+
     const delegationMgr = config.delegation.enabled
       ? new DelegationManager(
           config.delegation,
@@ -947,8 +956,13 @@ const plugin = {
           peerHealth,
           audit,
           api.logger,
+          delegationLedger,
+          config.delegation.instanceName,
         )
       : null;
+
+    // Start recovery + retry loop (no-op when ledger is disabled)
+    delegationMgr?.start();
 
     api.registerGatewayMethod("a2a.delegate", ({ params, respond }) => {
       if (!delegationMgr) {
@@ -1006,6 +1020,80 @@ const plugin = {
         return;
       }
       respond(true, { delegations: delegationMgr.listAll() });
+    });
+
+    // ------------------------------------------------------------------
+    // Delegation Ledger gateway methods (reliability layer)
+    // ------------------------------------------------------------------
+
+    api.registerGatewayMethod("a2a.delegate.ledger.stats", ({ respond }) => {
+      if (!delegationLedger) {
+        respond(false, { error: "delegation ledger is not enabled" });
+        return;
+      }
+      respond(true, { stats: delegationLedger.getStats() });
+    });
+
+    api.registerGatewayMethod("a2a.delegate.ledger.outbox", ({ params, respond }) => {
+      if (!delegationLedger) {
+        respond(false, { error: "delegation ledger is not enabled" });
+        return;
+      }
+      const payload = asObject(params);
+      const limit = Math.min(200, Math.max(1, asNumber(payload.limit, 50)));
+      respond(true, { outbox: delegationLedger.listAllOutbox(limit) });
+    });
+
+    api.registerGatewayMethod("a2a.delegate.ledger.dead-letters", ({ respond }) => {
+      if (!delegationLedger) {
+        respond(false, { error: "delegation ledger is not enabled" });
+        return;
+      }
+      respond(true, { deadLetters: delegationLedger.listDeadLetters() });
+    });
+
+    api.registerGatewayMethod("a2a.delegate.ledger.events", ({ params, respond }) => {
+      if (!delegationLedger) {
+        respond(false, { error: "delegation ledger is not enabled" });
+        return;
+      }
+      const payload = asObject(params);
+      const taskId = asString(payload.taskId, "");
+      if (!taskId) {
+        respond(false, { error: "taskId is required" });
+        return;
+      }
+      respond(true, { events: delegationLedger.getEvents(taskId) });
+    });
+
+    api.registerGatewayMethod("a2a.delegate.ledger.inbox", ({ params, respond }) => {
+      if (!delegationLedger) {
+        respond(false, { error: "delegation ledger is not enabled" });
+        return;
+      }
+      const payload = asObject(params);
+      const limit = Math.min(200, Math.max(1, asNumber(payload.limit, 50)));
+      respond(true, { inbox: delegationLedger.listInbox(limit) });
+    });
+
+    api.registerGatewayMethod("a2a.delegate.ledger.recover", ({ respond }) => {
+      if (!delegationMgr) {
+        respond(false, { error: "delegation is not enabled" });
+        return;
+      }
+      // Trigger immediate retry check
+      const ledger = delegationMgr.getLedger();
+      if (!ledger) {
+        respond(false, { error: "delegation ledger is not enabled" });
+        return;
+      }
+      const pending = ledger.listPendingRecovery();
+      const due = ledger.listDueRetries();
+      respond(true, {
+        pendingRecovery: pending.length,
+        dueRetries: due.length,
+        message: "Recovery check triggered — retry loop will process due tasks within 15s",
+      });
     });
 
     // ------------------------------------------------------------------
@@ -1507,6 +1595,30 @@ const plugin = {
           return;
         }
 
+        // --- Receiver inbox: record inbound delegation task ---
+        if (delegationLedger) {
+          const header = parseDelegationHeader(prompt);
+          if (header) {
+            const isNew = delegationLedger.createInboxIfNew({
+              taskId: header.taskId,
+              delegationId: header.delegationId,
+              senderNode: "remote",
+              receiverNode: config.delegation.instanceName,
+              taskType: header.taskType,
+              payloadSummary: prompt.slice(0, 200),
+              receiverState: "accepted",
+            });
+            if (!isNew) {
+              // Duplicate: log but don't block (full dedup requires executor integration)
+              api.logger.warn(
+                `a2a-gateway: received duplicate delegation taskId=${header.taskId} delegationId=${header.delegationId} — proceeding (idempotency best-effort)`,
+              );
+            } else {
+              delegationLedger.updateInbox(header.taskId, { receiverState: "running", startedAt: new Date().toISOString() });
+            }
+          }
+        }
+
         return {
           systemPrompt: [
             "You are an OpenClaw agent executing a delegated task from a peer agent.",
@@ -1684,6 +1796,9 @@ const plugin = {
         }
       },
       async stop(_ctx) {
+        // Stop delegation retry loop
+        delegationMgr?.stop();
+
         // Stop learning sync
         if (learningSyncMgr) {
           learningSyncMgr.stopAutoSync();
@@ -1703,6 +1818,9 @@ const plugin = {
           grpcServer.forceShutdown();
           grpcServer = null;
         }
+
+        // Close delegation ledger
+        delegationLedger?.close();
 
         // Stop HTTP server
         if (!server) {

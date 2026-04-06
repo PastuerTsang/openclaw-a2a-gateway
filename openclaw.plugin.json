@@ -336,6 +336,20 @@
             "default": 60,
             "minimum": 1,
             "description": "Max number of poll attempts before timeout (default 60)"
+          },
+          "ledgerEnabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Enable SQLite ledger for durable delegation reliability (default true)"
+          },
+          "ledgerPath": {
+            "type": "string",
+            "default": "data/delegation-ledger.db",
+            "description": "Path to SQLite ledger file (default: data/delegation-ledger.db)"
+          },
+          "instanceName": {
+            "type": "string",
+            "description": "Instance name embedded in task IDs, e.g. 'vm-main' or 'phone' (default: hostname)"
           }
         }
       }
