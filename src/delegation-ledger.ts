@@ -3,7 +3,7 @@
  *
  * Provides durable tracking of delegated task lifecycle:
  *   Sender outbox: queued → sending → awaiting_ack → acked → awaiting_result → done/failed/dead_lettered
- *   Receiver inbox: received → accepted/deduped → running → done/failed/partial
+ *   Receiver inbox: received → accepted → running → done/failed/partial
  *   Event log: immutable append-only timeline of state transitions
  *
  * Uses node:sqlite (Node.js 22+ built-in, experimental).
@@ -42,6 +42,22 @@ export type ReceiverState =
   | "partial";
 
 // ---------------------------------------------------------------------------
+// Execution guard types
+// ---------------------------------------------------------------------------
+
+export type ExecutionGuardStatus =
+  | "claimed"             // First execution — slot acquired, proceed
+  | "duplicate_running"   // Already running or accepted — do not re-execute
+  | "duplicate_done"      // Already completed (success)
+  | "duplicate_failed"    // Already failed
+  | "duplicate_partial";  // Partially completed
+
+export interface ExecutionGuardResult {
+  status: ExecutionGuardStatus;
+  existingEntry?: InboxEntry;
+}
+
+// ---------------------------------------------------------------------------
 // Entry types
 // ---------------------------------------------------------------------------
 
@@ -52,6 +68,7 @@ export interface OutboxEntry {
   targetNode: string;
   taskType: string;
   payloadSummary: string;
+  payloadJson: string | null;     // Full message payload for retry/replay
   deliveryState: SenderState;
   attempts: number;
   createdAt: string;
@@ -72,6 +89,7 @@ export interface InboxEntry {
   receiverNode: string;
   taskType: string;
   payloadSummary: string;
+  payloadJson: string | null;     // Full message payload received
   receiverState: ReceiverState;
   receivedAt: string;
   startedAt: string | null;
@@ -108,7 +126,7 @@ export function generateTaskId(senderNode: string): string {
     pad(now.getUTCHours()) +
     pad(now.getUTCMinutes()) +
     pad(now.getUTCSeconds());
-  const rand = randomBytes(2).toString("hex"); // 4 hex chars
+  const rand = randomBytes(2).toString("hex");
   const node = senderNode.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 20);
   return `a2a-${node}-${ts}-${rand}`;
 }
@@ -132,10 +150,9 @@ export const MAX_RETRY_ATTEMPTS = RETRY_DELAYS_MS.length;
  * Returns null when the attempt count exceeds the retry schedule (→ dead_lettered).
  */
 export function computeNextRetryAt(attempts: number): Date | null {
-  const index = attempts - 1; // attempts is already incremented before calling
+  const index = attempts - 1;
   if (index >= RETRY_DELAYS_MS.length) return null;
   const baseDelay = RETRY_DELAYS_MS[index];
-  // Add ±10% jitter to avoid thundering-herd on both sides
   const jitter = baseDelay * 0.1 * (Math.random() * 2 - 1);
   return new Date(Date.now() + baseDelay + jitter);
 }
@@ -144,7 +161,7 @@ export function computeNextRetryAt(attempts: number): Date | null {
 // Schema
 // ---------------------------------------------------------------------------
 
-const SCHEMA = `
+const SCHEMA_BASE = `
   CREATE TABLE IF NOT EXISTS delegated_outbox (
     task_id          TEXT PRIMARY KEY,
     delegation_id    TEXT NOT NULL,
@@ -152,6 +169,7 @@ const SCHEMA = `
     target_node      TEXT NOT NULL,
     task_type        TEXT NOT NULL,
     payload_summary  TEXT NOT NULL DEFAULT '',
+    payload_json     TEXT,
     delivery_state   TEXT NOT NULL DEFAULT 'queued',
     attempts         INTEGER NOT NULL DEFAULT 0,
     created_at       TEXT NOT NULL,
@@ -177,6 +195,7 @@ const SCHEMA = `
     receiver_node    TEXT NOT NULL,
     task_type        TEXT NOT NULL,
     payload_summary  TEXT NOT NULL DEFAULT '',
+    payload_json     TEXT,
     receiver_state   TEXT NOT NULL DEFAULT 'received',
     received_at      TEXT NOT NULL,
     started_at       TEXT,
@@ -212,6 +231,7 @@ function rowToOutbox(row: Record<string, unknown>): OutboxEntry {
     targetNode:    String(row["target_node"] ?? ""),
     taskType:      String(row["task_type"] ?? ""),
     payloadSummary: String(row["payload_summary"] ?? ""),
+    payloadJson:   row["payload_json"] != null ? String(row["payload_json"]) : null,
     deliveryState: (row["delivery_state"] as SenderState) ?? "queued",
     attempts:      Number(row["attempts"] ?? 0),
     createdAt:     String(row["created_at"] ?? ""),
@@ -234,6 +254,7 @@ function rowToInbox(row: Record<string, unknown>): InboxEntry {
     receiverNode:  String(row["receiver_node"] ?? ""),
     taskType:      String(row["task_type"] ?? ""),
     payloadSummary: String(row["payload_summary"] ?? ""),
+    payloadJson:   row["payload_json"] != null ? String(row["payload_json"]) : null,
     receiverState: (row["receiver_state"] as ReceiverState) ?? "received",
     receivedAt:    String(row["received_at"] ?? ""),
     startedAt:     row["started_at"] != null ? String(row["started_at"]) : null,
@@ -254,13 +275,128 @@ export class DelegationLedger {
   constructor(dbPath: string) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
-    // WAL mode for concurrent reads + single writer without blocking
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
-    this.db.exec(SCHEMA);
+    this.db.exec(SCHEMA_BASE);
+    this.migrate();
+  }
+
+  /**
+   * Run schema migrations for existing databases.
+   * Adds columns that were added in later versions.
+   */
+  private migrate(): void {
+    // payload_json columns (added in v2)
+    for (const table of ["delegated_outbox", "delegated_inbox"]) {
+      try {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN payload_json TEXT`);
+      } catch {
+        // Column already exists — expected for new databases
+      }
+    }
   }
 
   close(): void {
     this.db.close();
+  }
+
+  // -------------------------------------------------------------------------
+  // Execution guard — P0 core
+  // -------------------------------------------------------------------------
+
+  /**
+   * Atomically try to claim execution of an inbound task.
+   *
+   * Uses BEGIN IMMEDIATE transaction + SELECT-then-INSERT to guarantee
+   * that only ONE caller can ever get status='claimed' for a given taskId,
+   * even under concurrent requests.
+   *
+   * Returns:
+   *  'claimed'           — Slot acquired. Proceed with execution.
+   *  'duplicate_running' — Already accepted/running. Do NOT re-execute.
+   *  'duplicate_done'    — Already completed. Return cached result.
+   *  'duplicate_failed'  — Already failed. Return error info.
+   *  'duplicate_partial' — Already partial. Return partial result.
+   */
+  tryClaimExecution(params: {
+    taskId: string;
+    delegationId: string;
+    senderNode: string;
+    receiverNode: string;
+    taskType: string;
+    payloadSummary: string;
+    payloadJson?: string;
+  }): ExecutionGuardResult {
+    const now = new Date().toISOString();
+    let result: ExecutionGuardResult;
+
+    // BEGIN IMMEDIATE acquires a RESERVED lock, preventing other writers
+    // from entering while we check-and-insert.
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.db
+        .prepare("SELECT * FROM delegated_inbox WHERE task_id = ?")
+        .get(params.taskId);
+
+      if (!existing) {
+        // First time — insert and claim
+        this.db.prepare(`
+          INSERT INTO delegated_inbox
+            (task_id, delegation_id, sender_node, receiver_node, task_type,
+             payload_summary, payload_json, receiver_state, received_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', ?)
+        `).run(
+          params.taskId,
+          params.delegationId,
+          params.senderNode,
+          params.receiverNode,
+          params.taskType,
+          params.payloadSummary,
+          params.payloadJson ?? null,
+          now,
+        );
+
+        // Record execution guard acquired event
+        this.db.prepare(`
+          INSERT INTO delegated_events (task_id, event_type, event_payload, created_at)
+          VALUES (?, 'execution_guard_acquired', '{}', ?)
+        `).run(params.taskId, now);
+
+        this.db.exec("COMMIT");
+        result = { status: "claimed" };
+      } else {
+        // Duplicate — determine existing state
+        const entry = rowToInbox(existing as Record<string, unknown>);
+        const state = entry.receiverState;
+
+        // Record the duplicate detection event
+        this.db.prepare(`
+          INSERT INTO delegated_events (task_id, event_type, event_payload, created_at)
+          VALUES (?, 'execution_guard_rejected', ?, ?)
+        `).run(
+          params.taskId,
+          JSON.stringify({ existingState: state, delegationId: params.delegationId }),
+          now,
+        );
+
+        this.db.exec("COMMIT");
+
+        if (state === "done") {
+          result = { status: "duplicate_done", existingEntry: entry };
+        } else if (state === "failed") {
+          result = { status: "duplicate_failed", existingEntry: entry };
+        } else if (state === "partial") {
+          result = { status: "duplicate_partial", existingEntry: entry };
+        } else {
+          // accepted / running / waiting_dependency / received / deduped
+          result = { status: "duplicate_running", existingEntry: entry };
+        }
+      }
+    } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
+      throw err;
+    }
+
+    return result;
   }
 
   // -------------------------------------------------------------------------
@@ -272,16 +408,17 @@ export class DelegationLedger {
    */
   createOutbox(entry: Pick<OutboxEntry,
     "taskId" | "delegationId" | "senderNode" | "targetNode" | "taskType" | "payloadSummary"
-  > & { deliveryState?: SenderState }): void {
+  > & { deliveryState?: SenderState; payloadJson?: string }): void {
     const state = entry.deliveryState ?? "queued";
     this.db.prepare(`
       INSERT OR IGNORE INTO delegated_outbox
         (task_id, delegation_id, sender_node, target_node, task_type,
-         payload_summary, delivery_state, attempts, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+         payload_summary, payload_json, delivery_state, attempts, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
     `).run(
       entry.taskId, entry.delegationId, entry.senderNode, entry.targetNode,
-      entry.taskType, entry.payloadSummary, state, new Date().toISOString(),
+      entry.taskType, entry.payloadSummary, entry.payloadJson ?? null, state,
+      new Date().toISOString(),
     );
     this.addEvent(entry.taskId, "created", { state });
   }
@@ -304,10 +441,10 @@ export class DelegationLedger {
     if (updates.targetNode     !== undefined) { fields.push("target_node = ?");      values.push(updates.targetNode); }
     if (updates.taskType       !== undefined) { fields.push("task_type = ?");        values.push(updates.taskType); }
     if (updates.payloadSummary !== undefined) { fields.push("payload_summary = ?");  values.push(updates.payloadSummary); }
+    if (updates.payloadJson    !== undefined) { fields.push("payload_json = ?");     values.push(updates.payloadJson); }
 
     if (fields.length === 0) return;
     values.push(taskId);
-
     this.db.prepare(`UPDATE delegated_outbox SET ${fields.join(", ")} WHERE task_id = ?`).run(...values);
 
     if (updates.deliveryState) {
@@ -325,10 +462,7 @@ export class DelegationLedger {
     return row ? rowToOutbox(row as Record<string, unknown>) : null;
   }
 
-  /**
-   * Tasks that need to be re-queued / recovered after a process restart.
-   * Includes: sending, awaiting_ack, awaiting_result, retry_scheduled.
-   */
+  /** Tasks that need to be re-queued / recovered after a process restart. */
   listPendingRecovery(): OutboxEntry[] {
     const rows = this.db.prepare(`
       SELECT * FROM delegated_outbox
@@ -338,9 +472,7 @@ export class DelegationLedger {
     return (rows as Record<string, unknown>[]).map(rowToOutbox);
   }
 
-  /**
-   * Tasks in retry_scheduled state whose next_retry_at is past due.
-   */
+  /** Tasks in retry_scheduled state whose next_retry_at is past due. */
   listDueRetries(): OutboxEntry[] {
     const now = new Date().toISOString();
     const rows = this.db.prepare(`
@@ -367,16 +499,83 @@ export class DelegationLedger {
   }
 
   // -------------------------------------------------------------------------
+  // Dead-letter replay (P2)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Re-queue a dead_lettered task for retry.
+   * Creates a new outbox entry with a fresh taskId using the original payload.
+   * Marks the original as 'cancelled' with a supersededBy reference.
+   *
+   * Returns the new taskId, or null if the original task is not dead_lettered.
+   */
+  replayDeadLetter(originalTaskId: string): { newTaskId: string; originalTaskId: string } | null {
+    const original = this.getOutbox(originalTaskId);
+    if (!original || original.deliveryState !== "dead_lettered") return null;
+
+    const newTaskId = generateTaskId(original.senderNode);
+    const now = new Date().toISOString();
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // Create new queued entry with original payload
+      this.db.prepare(`
+        INSERT INTO delegated_outbox
+          (task_id, delegation_id, sender_node, target_node, task_type,
+           payload_summary, payload_json, delivery_state, attempts, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?)
+      `).run(
+        newTaskId,
+        original.delegationId + "-replay",
+        original.senderNode,
+        original.targetNode,
+        original.taskType,
+        original.payloadSummary,
+        original.payloadJson,
+        now,
+      );
+
+      // Mark original as cancelled (superseded)
+      this.db.prepare(`
+        UPDATE delegated_outbox
+        SET delivery_state = 'cancelled', error_message = ?
+        WHERE task_id = ?
+      `).run(`Superseded by replay: ${newTaskId}`, originalTaskId);
+
+      // Events
+      this.db.prepare(`
+        INSERT INTO delegated_events (task_id, event_type, event_payload, created_at)
+        VALUES (?, 'dead_letter_replayed', ?, ?)
+      `).run(originalTaskId, JSON.stringify({ newTaskId }), now);
+
+      this.db.prepare(`
+        INSERT INTO delegated_events (task_id, event_type, event_payload, created_at)
+        VALUES (?, 'replayed_from', ?, ?)
+      `).run(newTaskId, JSON.stringify({ originalTaskId }), now);
+
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
+      throw err;
+    }
+
+    return { newTaskId, originalTaskId };
+  }
+
+  // -------------------------------------------------------------------------
   // Inbox
   // -------------------------------------------------------------------------
 
   /**
    * Record a received inbound delegation task.
    * Returns true if newly created, false if task_id already exists (duplicate → deduped).
+   *
+   * NOTE: For atomic execution guard, prefer tryClaimExecution() instead.
+   * This method does NOT use a transaction — use only for non-critical logging.
    */
   createInboxIfNew(entry: Pick<InboxEntry,
     "taskId" | "delegationId" | "senderNode" | "receiverNode" | "taskType" | "payloadSummary"
-  > & { receiverState?: ReceiverState }): boolean {
+  > & { receiverState?: ReceiverState; payloadJson?: string }): boolean {
     const existing = this.db.prepare("SELECT task_id FROM delegated_inbox WHERE task_id = ?").get(entry.taskId);
     if (existing) return false;
 
@@ -384,11 +583,12 @@ export class DelegationLedger {
     this.db.prepare(`
       INSERT INTO delegated_inbox
         (task_id, delegation_id, sender_node, receiver_node, task_type,
-         payload_summary, receiver_state, received_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         payload_summary, payload_json, receiver_state, received_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       entry.taskId, entry.delegationId, entry.senderNode, entry.receiverNode,
-      entry.taskType, entry.payloadSummary, state, new Date().toISOString(),
+      entry.taskType, entry.payloadSummary, entry.payloadJson ?? null, state,
+      new Date().toISOString(),
     );
     this.addEvent(entry.taskId, "received", { state });
     return true;
@@ -409,7 +609,6 @@ export class DelegationLedger {
 
     if (fields.length === 0) return;
     values.push(taskId);
-
     this.db.prepare(`UPDATE delegated_inbox SET ${fields.join(", ")} WHERE task_id = ?`).run(...values);
     if (updates.receiverState) {
       this.addEvent(taskId, "receiver_state_change", { state: updates.receiverState });
@@ -458,7 +657,7 @@ export class DelegationLedger {
   }
 
   // -------------------------------------------------------------------------
-  // Stats
+  // Summary / Stats (P2: Phone-side visibility)
   // -------------------------------------------------------------------------
 
   getStats(): Record<string, number> {
@@ -478,5 +677,50 @@ export class DelegationLedger {
       stats[`inbox_${row.receiver_state}`] = row.cnt;
     }
     return stats;
+  }
+
+  /**
+   * Quick summary for phone-side operator visibility.
+   * Answers: "what tasks are stuck and where?"
+   */
+  getSummary(): {
+    pendingCount: number;
+    retryCount: number;
+    deadLetterCount: number;
+    inboxRunningCount: number;
+    recentDeadLetters: OutboxEntry[];
+    recentPending: OutboxEntry[];
+  } {
+    const stats = this.getStats();
+
+    const pendingCount =
+      (stats["outbox_queued"] ?? 0) +
+      (stats["outbox_sending"] ?? 0) +
+      (stats["outbox_awaiting_ack"] ?? 0) +
+      (stats["outbox_awaiting_result"] ?? 0) +
+      (stats["outbox_acked"] ?? 0);
+
+    const retryCount = stats["outbox_retry_scheduled"] ?? 0;
+    const deadLetterCount = stats["outbox_dead_lettered"] ?? 0;
+    const inboxRunningCount =
+      (stats["inbox_accepted"] ?? 0) +
+      (stats["inbox_running"] ?? 0) +
+      (stats["inbox_waiting_dependency"] ?? 0);
+
+    const recentDeadLetters = this.listDeadLetters().slice(0, 5);
+    const recentPending = (this.db.prepare(`
+      SELECT * FROM delegated_outbox
+      WHERE delivery_state IN ('queued','sending','awaiting_ack','awaiting_result','acked','retry_scheduled')
+      ORDER BY created_at DESC LIMIT 10
+    `).all() as Record<string, unknown>[]).map(rowToOutbox);
+
+    return {
+      pendingCount,
+      retryCount,
+      deadLetterCount,
+      inboxRunningCount,
+      recentDeadLetters,
+      recentPending,
+    };
   }
 }

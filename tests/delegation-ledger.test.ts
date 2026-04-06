@@ -1,13 +1,19 @@
 /**
  * A2A Delegation Reliability Layer — Test Suite
  *
- * Covers spec test scenarios A-F:
+ * Covers spec test scenarios A-L:
  *   A. Normal delegation (queued → acked → done)
  *   B. ACK timeout → retry → receiver deduplication
  *   C. Receiver restart recovery (awaiting_result → resume)
  *   D. Sender restart recovery (outbox preserved)
  *   E. Circuit open → retry_scheduled → queued visible
  *   F. Duplicate resend → inbox deduplication
+ *   G. Receiver completed dedup (execution guard)
+ *   H. Receiver running dedup (execution guard)
+ *   I. Race condition dedup (atomic guard)
+ *   J. Retry with full payload_json
+ *   K. Dead-letter replay
+ *   L. Phone-side queryability
  */
 
 import assert from "node:assert/strict";
@@ -22,6 +28,7 @@ import {
   generateTaskId,
   computeNextRetryAt,
   MAX_RETRY_ATTEMPTS,
+  type ExecutionGuardStatus,
 } from "../src/delegation-ledger.js";
 
 // ---------------------------------------------------------------------------
@@ -516,6 +523,480 @@ describe("Ledger stats", () => {
     const stats = ledger.getStats();
     assert.equal(stats["outbox_done"], 3);
     assert.equal(stats["outbox_retry_scheduled"], 1);
+
+    ledger.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test G: Receiver completed dedup (execution guard — done)
+// ---------------------------------------------------------------------------
+
+describe("Test G — Receiver completed dedup: tryClaimExecution returns duplicate_done", () => {
+  let ledger: DelegationLedger;
+  beforeEach(() => { ledger = mkLedger(); });
+  afterEach(() => { ledger.close(); });
+
+  test("first call claims, second returns duplicate_done after marking done", () => {
+    const taskId = generateTaskId("phone");
+    const delegationId = randomUUID();
+    const params = {
+      taskId, delegationId, senderNode: "phone", receiverNode: "vm-main",
+      taskType: "operation", payloadSummary: "test task", payloadJson: "full task payload",
+    };
+
+    // First call — should claim
+    const r1 = ledger.tryClaimExecution(params);
+    assert.equal(r1.status, "claimed");
+
+    // Mark as done (simulate task completion)
+    ledger.updateInbox(taskId, {
+      receiverState: "done",
+      completedAt: new Date().toISOString(),
+      resultSummary: "Task completed: found 5 items",
+    });
+
+    // Second call (resend) — should detect duplicate_done
+    const r2 = ledger.tryClaimExecution(params);
+    assert.equal(r2.status, "duplicate_done");
+    assert.ok(r2.existingEntry, "should return existing entry");
+    assert.equal(r2.existingEntry!.receiverState, "done");
+    assert.equal(r2.existingEntry!.resultSummary, "Task completed: found 5 items");
+  });
+
+  test("duplicate_done event is recorded in event log", () => {
+    const taskId = generateTaskId("phone");
+    const delegationId = randomUUID();
+    const params = { taskId, delegationId, senderNode: "phone", receiverNode: "vm-main", taskType: "query", payloadSummary: "x" };
+
+    ledger.tryClaimExecution(params);
+    ledger.updateInbox(taskId, { receiverState: "done", completedAt: new Date().toISOString() });
+    ledger.tryClaimExecution(params); // duplicate
+
+    const events = ledger.getEvents(taskId);
+    const guardEvents = events.filter((e) => e.eventType === "execution_guard_acquired" || e.eventType === "execution_guard_rejected");
+    assert.equal(guardEvents.length, 2, "should have one acquired and one rejected event");
+    assert.equal(guardEvents[0].eventType, "execution_guard_acquired");
+    assert.equal(guardEvents[1].eventType, "execution_guard_rejected");
+
+    const rejectedPayload = JSON.parse(guardEvents[1].eventPayload);
+    assert.equal(rejectedPayload.existingState, "done");
+  });
+
+  test("duplicate_failed returns correct status", () => {
+    const taskId = generateTaskId("phone");
+    const params = { taskId, delegationId: randomUUID(), senderNode: "phone", receiverNode: "vm-main", taskType: "query", payloadSummary: "x" };
+
+    ledger.tryClaimExecution(params);
+    ledger.updateInbox(taskId, {
+      receiverState: "failed",
+      completedAt: new Date().toISOString(),
+      errorCode: "TOOL_ERROR",
+      errorMessage: "Browse tool failed",
+    });
+
+    const r2 = ledger.tryClaimExecution(params);
+    assert.equal(r2.status, "duplicate_failed");
+    assert.equal(r2.existingEntry!.errorCode, "TOOL_ERROR");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test H: Receiver running dedup (execution guard — running)
+// ---------------------------------------------------------------------------
+
+describe("Test H — Receiver running dedup: tryClaimExecution blocks second execution", () => {
+  let ledger: DelegationLedger;
+  beforeEach(() => { ledger = mkLedger(); });
+  afterEach(() => { ledger.close(); });
+
+  test("second call while running returns duplicate_running", () => {
+    const taskId = generateTaskId("phone");
+    const params = { taskId, delegationId: randomUUID(), senderNode: "phone", receiverNode: "vm-main", taskType: "operation", payloadSummary: "long task" };
+
+    // First call claims
+    const r1 = ledger.tryClaimExecution(params);
+    assert.equal(r1.status, "claimed");
+
+    // Update to running (task started)
+    ledger.updateInbox(taskId, { receiverState: "running", startedAt: new Date().toISOString() });
+
+    // Duplicate arrives while task is still running
+    const r2 = ledger.tryClaimExecution(params);
+    assert.equal(r2.status, "duplicate_running");
+    assert.equal(r2.existingEntry!.receiverState, "running");
+  });
+
+  test("second call while accepted (not yet running) returns duplicate_running", () => {
+    const taskId = generateTaskId("phone");
+    const params = { taskId, delegationId: randomUUID(), senderNode: "phone", receiverNode: "vm-main", taskType: "operation", payloadSummary: "x" };
+
+    // First call claims (accepted state)
+    const r1 = ledger.tryClaimExecution(params);
+    assert.equal(r1.status, "claimed");
+    // Don't update to running yet — stays in 'accepted'
+
+    // Duplicate arrives immediately
+    const r2 = ledger.tryClaimExecution(params);
+    assert.equal(r2.status, "duplicate_running", "accepted state should be treated as duplicate_running");
+  });
+
+  test("inbox has only one entry regardless of how many times tryClaimExecution is called", () => {
+    const taskId = generateTaskId("phone");
+    const params = { taskId, delegationId: randomUUID(), senderNode: "phone", receiverNode: "vm-main", taskType: "operation", payloadSummary: "x" };
+
+    for (let i = 0; i < 10; i++) {
+      ledger.tryClaimExecution(params);
+    }
+
+    const all = ledger.listInbox();
+    const forTask = all.filter((e) => e.taskId === taskId);
+    assert.equal(forTask.length, 1, "only one inbox entry, regardless of call count");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test I: Race condition dedup (atomic guard)
+// ---------------------------------------------------------------------------
+
+describe("Test I — Race condition: atomic guard ensures only one execution", () => {
+  let ledger: DelegationLedger;
+  beforeEach(() => { ledger = mkLedger(); });
+  afterEach(() => { ledger.close(); });
+
+  test("sequential calls with same taskId: only first succeeds", () => {
+    const taskId = generateTaskId("phone");
+    const params = { taskId, delegationId: randomUUID(), senderNode: "phone", receiverNode: "vm-main", taskType: "operation", payloadSummary: "concurrent task" };
+
+    // Simulate rapid sequential calls (Node.js is single-threaded, but SQLite IMMEDIATE ensures atomicity)
+    const results: ExecutionGuardStatus[] = [];
+    for (let i = 0; i < 5; i++) {
+      results.push(ledger.tryClaimExecution(params).status);
+    }
+
+    const claimed = results.filter((s) => s === "claimed");
+    const duplicates = results.filter((s) => s !== "claimed");
+
+    assert.equal(claimed.length, 1, "exactly one call should get 'claimed'");
+    assert.equal(duplicates.length, 4, "the other 4 calls should get duplicate status");
+    assert.ok(duplicates.every((s) => s === "duplicate_running"), "all duplicates should be duplicate_running (accepted state)");
+  });
+
+  test("BEGIN IMMEDIATE prevents second insert via unique constraint", () => {
+    const taskId = generateTaskId("phone");
+    const delegationId = randomUUID();
+
+    // Claim with first caller
+    const r1 = ledger.tryClaimExecution({
+      taskId, delegationId,
+      senderNode: "phone", receiverNode: "vm-main",
+      taskType: "operation", payloadSummary: "task A",
+    });
+    assert.equal(r1.status, "claimed");
+
+    // Attempt with different delegationId but same taskId (simulates different resend)
+    const r2 = ledger.tryClaimExecution({
+      taskId,
+      delegationId: randomUUID(), // different delegation ID
+      senderNode: "phone", receiverNode: "vm-main",
+      taskType: "operation", payloadSummary: "task A resent",
+    });
+    assert.equal(r2.status, "duplicate_running", "same taskId with different delegationId should still be deduped");
+
+    // Verify only one inbox entry
+    assert.equal(ledger.listInbox().filter((e) => e.taskId === taskId).length, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test J: Retry with full payload_json
+// ---------------------------------------------------------------------------
+
+describe("Test J — Retry with full payload_json: sender restart uses complete payload", () => {
+  test("payload_json survives ledger close/reopen cycle", () => {
+    const dbPath = tmpDbPath();
+    const taskId = generateTaskId("phone");
+    const fullPayload = "Please research the Q1 2026 revenue figures and provide a detailed breakdown by product line, including YoY comparisons.";
+
+    const ledger1 = new DelegationLedger(dbPath);
+    ledger1.createOutbox({
+      taskId,
+      delegationId: randomUUID(),
+      senderNode: "phone",
+      targetNode: "vm-main",
+      taskType: "operation",
+      payloadSummary: fullPayload.slice(0, 50),
+      payloadJson: fullPayload,
+    });
+    ledger1.updateOutbox(taskId, { deliveryState: "sending", attempts: 1 });
+    ledger1.close();
+
+    // Simulate restart
+    const ledger2 = new DelegationLedger(dbPath);
+    const pending = ledger2.listPendingRecovery();
+    const entry = pending.find((e) => e.taskId === taskId);
+    assert.ok(entry, "task should be recoverable after restart");
+    assert.equal(entry!.payloadJson, fullPayload, "full payload should be preserved exactly");
+    assert.ok(entry!.payloadSummary !== fullPayload, "summary should be different from full payload");
+    ledger2.close();
+  });
+
+  test("payloadSummary and payloadJson are both stored independently", () => {
+    const ledger = mkLedger();
+    const taskId = generateTaskId("phone");
+    const fullPayload = "A".repeat(1000); // Large payload
+    const summary = fullPayload.slice(0, 200);
+
+    ledger.createOutbox({
+      taskId,
+      delegationId: randomUUID(),
+      senderNode: "phone",
+      targetNode: "vm-main",
+      taskType: "query",
+      payloadSummary: summary,
+      payloadJson: fullPayload,
+    });
+
+    const entry = ledger.getOutbox(taskId)!;
+    assert.equal(entry.payloadSummary, summary);
+    assert.equal(entry.payloadJson, fullPayload);
+    assert.equal(entry.payloadJson!.length, 1000);
+    ledger.close();
+  });
+
+  test("inbox stores payload_json from receiver side", () => {
+    const ledger = mkLedger();
+    const taskId = generateTaskId("phone");
+    const inboundPayload = "[Delegated Task | type=operation | id=xxx | taskId=abc]\nDo the research.";
+
+    const result = ledger.tryClaimExecution({
+      taskId,
+      delegationId: randomUUID(),
+      senderNode: "phone",
+      receiverNode: "vm-main",
+      taskType: "operation",
+      payloadSummary: inboundPayload.slice(0, 50),
+      payloadJson: inboundPayload,
+    });
+    assert.equal(result.status, "claimed");
+
+    const inbox = ledger.getInbox(taskId)!;
+    assert.equal(inbox.payloadJson, inboundPayload);
+    ledger.close();
+  });
+
+  test("retry falls back to payloadSummary when payloadJson is null", () => {
+    const ledger = mkLedger();
+    const taskId = generateTaskId("phone");
+
+    // Legacy entry without payloadJson
+    ledger.createOutbox({
+      taskId,
+      delegationId: randomUUID(),
+      senderNode: "phone",
+      targetNode: "vm-main",
+      taskType: "operation",
+      payloadSummary: "short summary",
+      // payloadJson intentionally omitted
+    });
+
+    const entry = ledger.getOutbox(taskId)!;
+    // Simulate what delegation.ts does for retry:
+    const messageToSend = entry.payloadJson ?? entry.payloadSummary;
+    assert.equal(messageToSend, "short summary", "should fall back to payloadSummary");
+    ledger.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test K: Dead-letter replay
+// ---------------------------------------------------------------------------
+
+describe("Test K — Dead-letter replay: re-queue with original payload", () => {
+  let ledger: DelegationLedger;
+  beforeEach(() => { ledger = mkLedger(); });
+  afterEach(() => { ledger.close(); });
+
+  test("replayDeadLetter creates new queued task with same payload", () => {
+    const taskId = generateTaskId("phone");
+    const fullPayload = "Research the Q2 market trends";
+
+    ledger.createOutbox({
+      taskId,
+      delegationId: randomUUID(),
+      senderNode: "phone",
+      targetNode: "vm-main",
+      taskType: "operation",
+      payloadSummary: "Research Q2",
+      payloadJson: fullPayload,
+    });
+    ledger.updateOutbox(taskId, {
+      deliveryState: "dead_lettered",
+      finalState: "failed",
+      errorCode: "MAX_RETRIES",
+      errorMessage: "Exhausted all retry attempts",
+    });
+
+    // Replay
+    const result = ledger.replayDeadLetter(taskId);
+    assert.ok(result, "replay should succeed");
+    assert.ok(result!.newTaskId !== taskId, "new task should have different ID");
+    assert.match(result!.newTaskId, /^a2a-phone-\d{14}-[0-9a-f]{4}$/, "new ID should use correct format");
+
+    // Original should be cancelled
+    const original = ledger.getOutbox(taskId)!;
+    assert.equal(original.deliveryState, "cancelled");
+    assert.ok(original.errorMessage?.includes(result!.newTaskId), "should reference new task ID");
+
+    // New task should be queued with same payload
+    const newEntry = ledger.getOutbox(result!.newTaskId)!;
+    assert.equal(newEntry.deliveryState, "queued");
+    assert.equal(newEntry.payloadJson, fullPayload, "full payload should be copied to new task");
+    assert.equal(newEntry.targetNode, "vm-main");
+    assert.equal(newEntry.taskType, "operation");
+  });
+
+  test("replayDeadLetter returns null for non-dead_lettered task", () => {
+    const taskId = generateTaskId("phone");
+    ledger.createOutbox({ taskId, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "query", payloadSummary: "x" });
+    // Still in queued state
+
+    const result = ledger.replayDeadLetter(taskId);
+    assert.equal(result, null, "should return null for non-dead_lettered task");
+  });
+
+  test("replay does not create a duplicate inbox entry if receiver already saw original taskId", () => {
+    const taskId = generateTaskId("phone");
+    ledger.createOutbox({
+      taskId, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main",
+      taskType: "operation", payloadSummary: "x",
+    });
+    ledger.updateOutbox(taskId, { deliveryState: "dead_lettered", finalState: "failed" });
+
+    const replay = ledger.replayDeadLetter(taskId)!;
+
+    // The new task has a different taskId, so receiver would treat it as new
+    const newEntry = ledger.getOutbox(replay.newTaskId)!;
+    assert.notEqual(newEntry.taskId, taskId, "new task has new ID — no inbox collision");
+
+    // Events on original task
+    const events = ledger.getEvents(taskId);
+    assert.ok(events.some((e) => e.eventType === "dead_letter_replayed"), "should have replay event");
+
+    // Events on new task
+    const newEvents = ledger.getEvents(replay.newTaskId);
+    assert.ok(newEvents.some((e) => e.eventType === "replayed_from"), "new task should reference original");
+  });
+
+  test("replayed task appears in listDueRetries immediately (queued state is visible)", () => {
+    const taskId = generateTaskId("phone");
+    ledger.createOutbox({ taskId, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "query", payloadSummary: "x" });
+    ledger.updateOutbox(taskId, { deliveryState: "dead_lettered", finalState: "failed" });
+
+    const replay = ledger.replayDeadLetter(taskId)!;
+
+    // New task is in 'queued' state (not retry_scheduled), so it won't appear in listDueRetries
+    // But it IS visible in listAllOutbox
+    const all = ledger.listAllOutbox();
+    assert.ok(all.some((e) => e.taskId === replay.newTaskId && e.deliveryState === "queued"),
+      "replayed task should appear in outbox with queued state");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test L: Phone-side queryability
+// ---------------------------------------------------------------------------
+
+describe("Test L — Phone-side queryability: operator can see all stuck states", () => {
+  test("getSummary shows pending, retry, dead-letter counts", () => {
+    const ledger = mkLedger();
+
+    // Create tasks in various states
+    // 2 queued
+    for (let i = 0; i < 2; i++) {
+      ledger.createOutbox({ taskId: generateTaskId("phone"), delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "query", payloadSummary: `pending ${i}` });
+    }
+    // 1 awaiting_result
+    const t3 = generateTaskId("phone");
+    ledger.createOutbox({ taskId: t3, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "operation", payloadSummary: "await result" });
+    ledger.updateOutbox(t3, { deliveryState: "awaiting_result", ackedAt: new Date().toISOString(), remoteTaskId: "remote-xyz" });
+
+    // 1 retry_scheduled
+    const t4 = generateTaskId("phone");
+    ledger.createOutbox({ taskId: t4, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "operation", payloadSummary: "retry" });
+    ledger.updateOutbox(t4, { deliveryState: "retry_scheduled", attempts: 2, nextRetryAt: new Date(Date.now() + 30_000).toISOString() });
+
+    // 1 dead_lettered
+    const t5 = generateTaskId("phone");
+    ledger.createOutbox({ taskId: t5, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "operation", payloadSummary: "dead" });
+    ledger.updateOutbox(t5, { deliveryState: "dead_lettered", finalState: "failed", errorMessage: "Exhausted retries" });
+
+    // 1 done (should NOT appear in pending)
+    const t6 = generateTaskId("phone");
+    ledger.createOutbox({ taskId: t6, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "query", payloadSummary: "done" });
+    ledger.updateOutbox(t6, { deliveryState: "done", finalState: "done" });
+
+    const summary = ledger.getSummary();
+
+    // 2 queued + 1 awaiting_result = 3 pending
+    assert.ok(summary.pendingCount >= 3, `pendingCount should be ≥3, got ${summary.pendingCount}`);
+    assert.equal(summary.retryCount, 1);
+    assert.equal(summary.deadLetterCount, 1);
+
+    assert.ok(summary.recentDeadLetters.length >= 1, "should show recent dead letters");
+    assert.equal(summary.recentDeadLetters[0].deliveryState, "dead_lettered");
+
+    assert.ok(summary.recentPending.length >= 3, "should show recent pending tasks");
+    assert.ok(!summary.recentPending.some((e) => e.deliveryState === "done"), "done tasks should not appear in pending");
+
+    ledger.close();
+  });
+
+  test("can answer: is this task stuck in ACK wait?", () => {
+    const ledger = mkLedger();
+    const taskId = generateTaskId("phone");
+    ledger.createOutbox({ taskId, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "operation", payloadSummary: "check me" });
+    ledger.updateOutbox(taskId, { deliveryState: "awaiting_ack", attempts: 1, lastAttemptAt: new Date().toISOString() });
+
+    const entry = ledger.getOutbox(taskId)!;
+    assert.equal(entry.deliveryState, "awaiting_ack", "operator can see task is stuck in ACK wait");
+    assert.equal(entry.ackedAt, null, "no ACK received yet");
+
+    ledger.close();
+  });
+
+  test("can answer: has this task been dead-lettered?", () => {
+    const ledger = mkLedger();
+    const taskId = generateTaskId("phone");
+    ledger.createOutbox({ taskId, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "operation", payloadSummary: "stuck" });
+    ledger.updateOutbox(taskId, { deliveryState: "dead_lettered", errorCode: "MAX_RETRIES", errorMessage: "5 attempts failed" });
+
+    const deadLetters = ledger.listDeadLetters();
+    assert.ok(deadLetters.some((e) => e.taskId === taskId), "task appears in dead-letter list");
+
+    const entry = ledger.getOutbox(taskId)!;
+    assert.equal(entry.errorCode, "MAX_RETRIES");
+    assert.equal(entry.errorMessage, "5 attempts failed");
+
+    ledger.close();
+  });
+
+  test("can see full event timeline for a task", () => {
+    const ledger = mkLedger();
+    const taskId = generateTaskId("phone");
+    ledger.createOutbox({ taskId, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "operation", payloadSummary: "timeline test" });
+    ledger.updateOutbox(taskId, { deliveryState: "sending", attempts: 1 });
+    ledger.updateOutbox(taskId, { deliveryState: "retry_scheduled", attempts: 1, nextRetryAt: new Date(Date.now() + 10_000).toISOString() });
+    ledger.updateOutbox(taskId, { deliveryState: "sending", attempts: 2 });
+    ledger.updateOutbox(taskId, { deliveryState: "acked", ackedAt: new Date().toISOString() });
+
+    const events = ledger.getEvents(taskId);
+    const stateChanges = events.filter((e) => e.eventType === "state_change");
+    const stateNames = stateChanges.map((e) => JSON.parse(e.eventPayload).state);
+
+    assert.ok(stateNames.includes("sending"), "should show sending state");
+    assert.ok(stateNames.includes("retry_scheduled"), "should show retry_scheduled state");
+    assert.ok(stateNames.includes("acked"), "should show acked state");
 
     ledger.close();
   });

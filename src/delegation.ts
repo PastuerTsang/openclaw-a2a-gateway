@@ -168,7 +168,7 @@ export class DelegationManager {
     if (!this.peerHealth.isAvailable(opts.peer)) {
       const errMsg = `Peer "${opts.peer}" is unavailable (circuit breaker open)`;
 
-      // Record in ledger as queued → dead_lettered (circuit open)
+      // Record in ledger as queued → retry_scheduled (circuit open)
       if (this.ledger) {
         this.ledger.createOutbox({
           taskId,
@@ -177,6 +177,7 @@ export class DelegationManager {
           targetNode: opts.peer,
           taskType: opts.taskType,
           payloadSummary: opts.message.slice(0, 200),
+          payloadJson: opts.message,   // Full payload for retry
           deliveryState: "queued",
         });
         // Move to retry_scheduled so it can be retried when circuit closes
@@ -212,7 +213,7 @@ export class DelegationManager {
       }
     }
 
-    // --- Record in ledger (queued) ---
+    // --- Record in ledger (queued) with full payload ---
     if (this.ledger) {
       this.ledger.createOutbox({
         taskId,
@@ -221,6 +222,7 @@ export class DelegationManager {
         targetNode: opts.peer,
         taskType: opts.taskType,
         payloadSummary: opts.message.slice(0, 200),
+        payloadJson: opts.message,    // Full payload for retry/recovery
         deliveryState: "queued",
       });
     }
@@ -616,11 +618,12 @@ export class DelegationManager {
           `a2a-gateway: retrying delegation ${entry.delegationId} (attempt ${entry.attempts + 1})`,
         );
 
+        // Use full payload_json for retry — falls back to summary only if null
+        const message = entry.payloadJson ?? entry.payloadSummary;
         const opts: DelegateOptions = {
           peer: peer.name,
           taskType: entry.taskType as DelegationTaskType,
-          // Reconstruct minimal message from summary (full payload not stored)
-          message: entry.payloadSummary,
+          message,
           waitForResult: true,
         };
 

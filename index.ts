@@ -1096,6 +1096,41 @@ const plugin = {
       });
     });
 
+    // Quick health summary for phone-side operator visibility (P2)
+    api.registerGatewayMethod("a2a.delegate.ledger.summary", ({ respond }) => {
+      if (!delegationLedger) {
+        respond(false, { error: "delegation ledger is not enabled" });
+        return;
+      }
+      respond(true, delegationLedger.getSummary());
+    });
+
+    // Dead-letter replay — re-queue a failed task with original payload (P2)
+    api.registerGatewayMethod("a2a.delegate.ledger.replay", ({ params, respond }) => {
+      if (!delegationLedger) {
+        respond(false, { error: "delegation ledger is not enabled" });
+        return;
+      }
+      const payload = asObject(params);
+      const taskId = asString(payload.taskId, "");
+      if (!taskId) {
+        respond(false, { error: "taskId is required" });
+        return;
+      }
+      const result = delegationLedger.replayDeadLetter(taskId);
+      if (!result) {
+        respond(false, { error: `Task ${taskId} not found or not in dead_lettered state` });
+        return;
+      }
+      void audit.record({
+        ts: new Date().toISOString(),
+        action: "delegation_replay",
+        detail: `originalTaskId=${result.originalTaskId} newTaskId=${result.newTaskId}`,
+        ok: true,
+      });
+      respond(true, result);
+    });
+
     // ------------------------------------------------------------------
     // Memory Query gateway methods (Phase 3)
     // ------------------------------------------------------------------
@@ -1595,26 +1630,97 @@ const plugin = {
           return;
         }
 
-        // --- Receiver inbox: record inbound delegation task ---
+        // --- Receiver execution guard (P0: atomic dedup) ---
         if (delegationLedger) {
           const header = parseDelegationHeader(prompt);
           if (header) {
-            const isNew = delegationLedger.createInboxIfNew({
+            // Atomically try to claim the execution slot.
+            // BEGIN IMMEDIATE transaction ensures only ONE execution path succeeds.
+            const guardResult = delegationLedger.tryClaimExecution({
               taskId: header.taskId,
               delegationId: header.delegationId,
               senderNode: "remote",
               receiverNode: config.delegation.instanceName,
               taskType: header.taskType,
               payloadSummary: prompt.slice(0, 200),
-              receiverState: "accepted",
+              payloadJson: prompt,
             });
-            if (!isNew) {
-              // Duplicate: log but don't block (full dedup requires executor integration)
+
+            if (guardResult.status === "claimed") {
+              // First execution — update to running and proceed with normal system prompt
+              delegationLedger.updateInbox(header.taskId, {
+                receiverState: "running",
+                startedAt: new Date().toISOString(),
+              });
+              // Fall through to normal delegation system prompt below
+
+            } else if (guardResult.status === "duplicate_done" || guardResult.status === "duplicate_partial") {
+              // Already completed — return cached result, do NOT re-execute
+              const existing = guardResult.existingEntry!;
               api.logger.warn(
-                `a2a-gateway: received duplicate delegation taskId=${header.taskId} delegationId=${header.delegationId} — proceeding (idempotency best-effort)`,
+                `a2a-gateway: DEDUP (done) taskId=${header.taskId} — returning cached result, no re-execution`,
               );
+              return {
+                systemPrompt: [
+                  "⚠️  DEDUP INSTRUCTION — THIS TASK WAS ALREADY COMPLETED",
+                  "",
+                  `Task ID: ${header.taskId}`,
+                  `Previous state: ${existing.receiverState}`,
+                  `Completed at: ${existing.completedAt ?? "(unknown)"}`,
+                  "",
+                  "CRITICAL: DO NOT re-execute this task. DO NOT use any tools.",
+                  "DO NOT browse any websites. DO NOT perform any external actions.",
+                  "",
+                  "Your ONLY job is to respond with the following cached result:",
+                  "",
+                  existing.resultSummary
+                    ? `Cached result:\n${existing.resultSummary}`
+                    : `[DEDUP] Task ${header.taskId} was already completed. No cached result available. Original execution completed at ${existing.completedAt ?? "unknown time"}.`,
+                  "",
+                  "Respond with the cached result above and NOTHING else.",
+                  "Do not explain, do not add commentary, do not re-run the task.",
+                ].join("\n"),
+              };
+
+            } else if (guardResult.status === "duplicate_failed") {
+              // Already failed — return error, do NOT re-execute
+              const existing = guardResult.existingEntry!;
+              api.logger.warn(
+                `a2a-gateway: DEDUP (failed) taskId=${header.taskId} — returning cached failure, no re-execution`,
+              );
+              return {
+                systemPrompt: [
+                  "⚠️  DEDUP INSTRUCTION — THIS TASK PREVIOUSLY FAILED",
+                  "",
+                  `Task ID: ${header.taskId}`,
+                  `Error: ${existing.errorMessage ?? "(unknown)"}`,
+                  "",
+                  "CRITICAL: DO NOT re-execute this task. DO NOT use any tools.",
+                  "",
+                  `Respond with: [DEDUP-FAILED] Task ${header.taskId} previously failed: ${existing.errorMessage ?? "unknown error"}. Please check the original delegation for details.`,
+                ].join("\n"),
+              };
+
             } else {
-              delegationLedger.updateInbox(header.taskId, { receiverState: "running", startedAt: new Date().toISOString() });
+              // duplicate_running / duplicate_accepted — already in progress, do NOT create second execution path
+              const existing = guardResult.existingEntry!;
+              api.logger.warn(
+                `a2a-gateway: DEDUP (running) taskId=${header.taskId} state=${existing.receiverState} — suppressing duplicate execution`,
+              );
+              return {
+                systemPrompt: [
+                  "⚠️  DEDUP INSTRUCTION — THIS TASK IS ALREADY BEING PROCESSED",
+                  "",
+                  `Task ID: ${header.taskId}`,
+                  `Current state: ${existing.receiverState}`,
+                  `Started at: ${existing.startedAt ?? "(unknown)"}`,
+                  "",
+                  "CRITICAL: DO NOT re-execute this task. DO NOT use any tools.",
+                  "DO NOT start any new work. This task is already running in another session.",
+                  "",
+                  `Respond with: [DEDUP-RUNNING] Task ${header.taskId} is already being processed (state: ${existing.receiverState}). Please wait for the original execution to complete.`,
+                ].join("\n"),
+              };
             }
           }
         }
