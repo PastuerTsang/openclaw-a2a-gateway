@@ -1,7 +1,7 @@
 /**
  * A2A Delegation Reliability Layer — Test Suite
  *
- * Covers spec test scenarios A-L:
+ * Covers spec test scenarios A-S:
  *   A. Normal delegation (queued → acked → done)
  *   B. ACK timeout → retry → receiver deduplication
  *   C. Receiver restart recovery (awaiting_result → resume)
@@ -14,6 +14,13 @@
  *   J. Retry with full payload_json
  *   K. Dead-letter replay
  *   L. Phone-side queryability
+ *   M. Complete result caching (P0)
+ *   N. Duplicate shell governance (P1)
+ *   O. Health metrics (P2)
+ *   P. Readiness: trial level (P3)
+ *   Q. Readiness: guarded_prod level (P3)
+ *   R. Readiness: prod_candidate level (P3)
+ *   S. Readiness: prod_ready level (P3)
  */
 
 import assert from "node:assert/strict";
@@ -29,6 +36,7 @@ import {
   computeNextRetryAt,
   MAX_RETRY_ATTEMPTS,
   type ExecutionGuardStatus,
+  type ReadinessLevel,
 } from "../src/delegation-ledger.js";
 
 // ---------------------------------------------------------------------------
@@ -997,6 +1005,479 @@ describe("Test L — Phone-side queryability: operator can see all stuck states"
     assert.ok(stateNames.includes("sending"), "should show sending state");
     assert.ok(stateNames.includes("retry_scheduled"), "should show retry_scheduled state");
     assert.ok(stateNames.includes("acked"), "should show acked state");
+
+    ledger.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test M: Complete result caching (P0) — duplicate_done returns cached result
+// ---------------------------------------------------------------------------
+
+describe("Test M — Complete result caching: recordInboxResult enables duplicate_done replay", () => {
+  let ledger: DelegationLedger;
+  beforeEach(() => { ledger = mkLedger(); });
+  afterEach(() => { ledger.close(); });
+
+  test("recordInboxResult stores result_json, duplicate_done replay returns it", () => {
+    const taskId = generateTaskId("phone");
+    const params = {
+      taskId, delegationId: randomUUID(), senderNode: "phone", receiverNode: "vm-main",
+      taskType: "operation", payloadSummary: "research task",
+    };
+    const fullResult = JSON.stringify({ items: [1, 2, 3], total: 3, summary: "Found 3 items" });
+
+    ledger.tryClaimExecution(params);
+
+    // Record full result after execution
+    ledger.recordInboxResult(taskId, {
+      receiverState: "done",
+      resultJson: fullResult,
+      resultSummary: "Found 3 items",
+    });
+
+    // Duplicate resend — should return cached result
+    const r2 = ledger.tryClaimExecution(params);
+    assert.equal(r2.status, "duplicate_done");
+    assert.ok(r2.existingEntry, "should return existing entry");
+    assert.equal(r2.existingEntry!.resultJson, fullResult, "should return full cached result JSON");
+    assert.equal(r2.existingEntry!.resultSummary, "Found 3 items");
+    assert.equal(r2.existingEntry!.completedAt !== null, true, "completedAt should be set");
+  });
+
+  test("recordInboxResult for failed task: duplicate_failed returns cached error", () => {
+    const taskId = generateTaskId("phone");
+    const params = {
+      taskId, delegationId: randomUUID(), senderNode: "phone", receiverNode: "vm-main",
+      taskType: "operation", payloadSummary: "failing task",
+    };
+
+    ledger.tryClaimExecution(params);
+    ledger.recordInboxResult(taskId, {
+      receiverState: "failed",
+      errorCode: "TOOL_TIMEOUT",
+      errorMessage: "Web browse tool timed out after 30s",
+    });
+
+    const r2 = ledger.tryClaimExecution(params);
+    assert.equal(r2.status, "duplicate_failed");
+    assert.equal(r2.existingEntry!.errorCode, "TOOL_TIMEOUT");
+    assert.equal(r2.existingEntry!.errorMessage, "Web browse tool timed out after 30s");
+  });
+
+  test("recordInboxResult for partial task: duplicate_partial returns cached partial result", () => {
+    const taskId = generateTaskId("phone");
+    const params = {
+      taskId, delegationId: randomUUID(), senderNode: "phone", receiverNode: "vm-main",
+      taskType: "analysis", payloadSummary: "partial analysis",
+    };
+    const partialResult = JSON.stringify({ completed: ["step1", "step2"], pending: ["step3"] });
+
+    ledger.tryClaimExecution(params);
+    ledger.recordInboxResult(taskId, {
+      receiverState: "partial",
+      resultJson: partialResult,
+      resultSummary: "Completed 2/3 steps",
+    });
+
+    const r2 = ledger.tryClaimExecution(params);
+    assert.equal(r2.status, "duplicate_partial");
+    assert.equal(r2.existingEntry!.resultJson, partialResult);
+    assert.equal(r2.existingEntry!.resultSummary, "Completed 2/3 steps");
+  });
+
+  test("result_recorded event is written to event log", () => {
+    const taskId = generateTaskId("phone");
+    const params = {
+      taskId, delegationId: randomUUID(), senderNode: "phone", receiverNode: "vm-main",
+      taskType: "query", payloadSummary: "q",
+    };
+    ledger.tryClaimExecution(params);
+    ledger.recordInboxResult(taskId, { receiverState: "done", resultSummary: "ok" });
+
+    const events = ledger.getEvents(taskId);
+    assert.ok(events.some((e) => e.eventType === "result_recorded"), "should have result_recorded event");
+    const recEvent = events.find((e) => e.eventType === "result_recorded")!;
+    assert.equal(JSON.parse(recEvent.eventPayload).state, "done");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test N: Duplicate shell governance (P1)
+// ---------------------------------------------------------------------------
+
+describe("Test N — Duplicate shell governance: mark, list, and clean duplicate shells", () => {
+  let ledger: DelegationLedger;
+  beforeEach(() => { ledger = mkLedger(); });
+  afterEach(() => { ledger.close(); });
+
+  test("markDuplicateShell records a shell entry visible in listDuplicateShells", () => {
+    const taskId = generateTaskId("phone");
+    const shellId = "sdk-task-" + randomUUID().slice(0, 8);
+
+    ledger.markDuplicateShell(taskId, shellId, "duplicate_running");
+
+    const shells = ledger.listDuplicateShells();
+    assert.equal(shells.length, 1);
+    assert.equal(shells[0].taskId, taskId);
+    assert.equal(shells[0].shellId, shellId);
+    assert.equal(shells[0].reason, "duplicate_running");
+    assert.equal(shells[0].cleanedAt, null, "should not be cleaned yet");
+  });
+
+  test("multiple shells for same task can be recorded", () => {
+    const taskId = generateTaskId("phone");
+    ledger.markDuplicateShell(taskId, "shell-1");
+    ledger.markDuplicateShell(taskId, "shell-2");
+    ledger.markDuplicateShell(taskId, "shell-3");
+
+    const shells = ledger.listDuplicateShells();
+    const forTask = shells.filter((s) => s.taskId === taskId);
+    assert.equal(forTask.length, 3, "all three shells should be recorded");
+  });
+
+  test("cleanDuplicateShells marks old shells as cleaned and excludes from default listing", () => {
+    const taskId = generateTaskId("phone");
+
+    ledger.markDuplicateShell(taskId, "old-shell", "duplicate");
+
+    // Clean with 0ms threshold to force all shells to be cleaned immediately
+    const cleaned = ledger.cleanDuplicateShells(0);
+    assert.ok(cleaned >= 1, "should clean at least one shell");
+
+    const activeShells = ledger.listDuplicateShells(false);
+    assert.equal(activeShells.filter((s) => s.taskId === taskId).length, 0, "cleaned shells excluded from default listing");
+  });
+
+  test("listDuplicateShells(includeClean=true) returns all shells including cleaned", () => {
+    const taskId = generateTaskId("phone");
+    ledger.markDuplicateShell(taskId, "shell-a");
+
+    // Clean with 0ms threshold to force clean
+    ledger.cleanDuplicateShells(0);
+
+    const activeOnly = ledger.listDuplicateShells(false);
+    const allIncluding = ledger.listDuplicateShells(true);
+
+    assert.equal(activeOnly.length, 0, "cleaned shells excluded from active listing");
+    assert.equal(allIncluding.length, 1, "cleaned shells visible when includeClean=true");
+    assert.ok(allIncluding[0].cleanedAt !== null, "cleaned shell should have cleanedAt");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test O: Health metrics (P2)
+// ---------------------------------------------------------------------------
+
+describe("Test O — Health metrics: getHealthMetrics returns correct production indicators", () => {
+  test("empty ledger returns all-zero health metrics", () => {
+    const ledger = mkLedger();
+    const h = ledger.getHealthMetrics();
+
+    assert.equal(h.pendingCount, 0);
+    assert.equal(h.retryCount, 0);
+    assert.equal(h.deadLetterCount, 0);
+    assert.equal(h.duplicateShellCount, 0);
+    assert.equal(h.last24h.totalSent, 0);
+    assert.equal(h.last24h.totalDone, 0);
+    assert.equal(h.last24h.totalFailed, 0);
+    assert.equal(h.last24h.totalDeadLettered, 0);
+    assert.equal(h.last24h.duplicateBlocked, 0);
+    assert.equal(h.successRate, 0);
+    assert.equal(h.errorRate, 0);
+    assert.equal(h.deadLetterRate, 0);
+    assert.equal(h.avgLatencyMs, null);
+    assert.equal(h.consecutiveErrors, 0);
+
+    ledger.close();
+  });
+
+  test("pendingCount, retryCount, deadLetterCount match task state distribution", () => {
+    const ledger = mkLedger();
+
+    // 2 queued (counts as pending)
+    for (let i = 0; i < 2; i++) {
+      ledger.createOutbox({ taskId: generateTaskId("phone"), delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "query", payloadSummary: "x" });
+    }
+    // 1 retry_scheduled
+    const tRetry = generateTaskId("phone");
+    ledger.createOutbox({ taskId: tRetry, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "query", payloadSummary: "x" });
+    ledger.updateOutbox(tRetry, { deliveryState: "retry_scheduled", attempts: 1, nextRetryAt: new Date(Date.now() + 30_000).toISOString() });
+
+    // 1 dead_lettered
+    const tDead = generateTaskId("phone");
+    ledger.createOutbox({ taskId: tDead, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "query", payloadSummary: "x" });
+    ledger.updateOutbox(tDead, { deliveryState: "dead_lettered", finalState: "failed" });
+
+    const h = ledger.getHealthMetrics();
+    assert.equal(h.pendingCount, 2, "2 queued tasks should be pending");
+    assert.equal(h.retryCount, 1);
+    assert.equal(h.deadLetterCount, 1);
+
+    ledger.close();
+  });
+
+  test("last24h.totalDone and successRate are correct for done tasks", () => {
+    const ledger = mkLedger();
+    const now = new Date().toISOString();
+
+    // 3 done, 1 failed
+    for (let i = 0; i < 3; i++) {
+      const t = generateTaskId("phone");
+      ledger.createOutbox({ taskId: t, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "query", payloadSummary: "x" });
+      ledger.updateOutbox(t, { deliveryState: "done", finalState: "done", resultAt: now });
+    }
+    const tFail = generateTaskId("phone");
+    ledger.createOutbox({ taskId: tFail, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "query", payloadSummary: "x" });
+    ledger.updateOutbox(tFail, { deliveryState: "failed", finalState: "failed", resultAt: now });
+
+    const h = ledger.getHealthMetrics();
+    assert.equal(h.last24h.totalDone, 3);
+    assert.equal(h.last24h.totalFailed, 1);
+    assert.ok(Math.abs(h.successRate - 0.75) < 0.01, `successRate should be ~0.75, got ${h.successRate}`);
+    assert.ok(Math.abs(h.errorRate - 0.25) < 0.01, `errorRate should be ~0.25, got ${h.errorRate}`);
+
+    ledger.close();
+  });
+
+  test("consecutiveErrors counts recent failures at head of history", () => {
+    const ledger = mkLedger();
+
+    // 1 success, then 3 failures (most recent)
+    const tDone = generateTaskId("phone");
+    ledger.createOutbox({ taskId: tDone, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "query", payloadSummary: "x" });
+    ledger.updateOutbox(tDone, { deliveryState: "done", resultAt: new Date(Date.now() - 4000).toISOString() });
+
+    for (let i = 0; i < 3; i++) {
+      const t = generateTaskId("phone");
+      ledger.createOutbox({ taskId: t, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "query", payloadSummary: "x" });
+      ledger.updateOutbox(t, { deliveryState: "failed", resultAt: new Date(Date.now() - (3 - i) * 1000).toISOString() });
+    }
+
+    const h = ledger.getHealthMetrics();
+    assert.equal(h.consecutiveErrors, 3, "3 most recent tasks failed consecutively");
+
+    ledger.close();
+  });
+
+  test("duplicateShellCount reflects uncleaned shells", () => {
+    const ledger = mkLedger();
+    const taskId = generateTaskId("phone");
+
+    ledger.markDuplicateShell(taskId, "s1");
+    ledger.markDuplicateShell(taskId, "s2");
+
+    const h1 = ledger.getHealthMetrics();
+    assert.equal(h1.duplicateShellCount, 2);
+
+    ledger.cleanDuplicateShells(0);
+    const h2 = ledger.getHealthMetrics();
+    assert.equal(h2.duplicateShellCount, 0, "cleaned shells should not count");
+
+    ledger.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test P: Readiness — trial level (no data)
+// ---------------------------------------------------------------------------
+
+describe("Test P — Readiness trial: fresh ledger stays at trial level", () => {
+  test("empty ledger returns trial level with recommendation to resolve issues", () => {
+    const ledger = mkLedger();
+    const r = ledger.getReadiness();
+
+    assert.equal(r.currentLevel, "trial");
+    assert.ok(r.recommendation.length > 0);
+    assert.ok(Array.isArray(r.blockingIssues));
+    assert.ok(Array.isArray(r.warningIssues));
+
+    ledger.close();
+  });
+
+  test("ledger with dead-lettered tasks stays at trial with blocking issues", () => {
+    const ledger = mkLedger();
+    const now = new Date().toISOString();
+
+    // 1 dead_lettered
+    const tDead = generateTaskId("phone");
+    ledger.createOutbox({ taskId: tDead, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "q", payloadSummary: "x" });
+    ledger.updateOutbox(tDead, { deliveryState: "dead_lettered", finalState: "failed", lastAttemptAt: now });
+
+    const r = ledger.getReadiness();
+    assert.equal(r.currentLevel, "trial");
+    assert.ok(r.blockingIssues.some((i) => i.includes("dead-lettered")), "should report dead-letter blocking issue");
+
+    ledger.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test Q: Readiness — guarded_prod level
+// ---------------------------------------------------------------------------
+
+describe("Test Q — Readiness guarded_prod: 0 DLQ + low error rate", () => {
+  test("all tasks done, 0 DLQ → guarded_prod", () => {
+    const ledger = mkLedger();
+    const now = new Date().toISOString();
+
+    // 5 successful tasks, 0 failures, 0 DLQ
+    for (let i = 0; i < 5; i++) {
+      const t = generateTaskId("phone");
+      ledger.createOutbox({ taskId: t, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "query", payloadSummary: "x" });
+      ledger.updateOutbox(t, { deliveryState: "done", finalState: "done", resultAt: now });
+    }
+
+    const r = ledger.getReadiness();
+    const acceptableLevels: ReadinessLevel[] = ["guarded_prod", "prod_candidate", "prod_ready"];
+    assert.ok(acceptableLevels.includes(r.currentLevel),
+      `should be guarded_prod or higher, got ${r.currentLevel}`);
+    assert.equal(r.blockingIssues.filter((i) => i.includes("dead-letter")).length, 0);
+
+    ledger.close();
+  });
+
+  test("high error rate (>5%) blocks guarded_prod", () => {
+    const ledger = mkLedger();
+    const now = new Date().toISOString();
+
+    // 1 done, 10 failed = ~91% error rate
+    const tDone = generateTaskId("phone");
+    ledger.createOutbox({ taskId: tDone, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "q", payloadSummary: "x" });
+    ledger.updateOutbox(tDone, { deliveryState: "done", resultAt: now });
+
+    for (let i = 0; i < 10; i++) {
+      const t = generateTaskId("phone");
+      ledger.createOutbox({ taskId: t, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "q", payloadSummary: "x" });
+      ledger.updateOutbox(t, { deliveryState: "failed", resultAt: now });
+    }
+
+    const r = ledger.getReadiness();
+    assert.equal(r.currentLevel, "trial");
+    assert.ok(r.blockingIssues.some((i) => i.includes("Error rate")), "should report high error rate as blocking");
+
+    ledger.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test R: Readiness — prod_candidate level
+// ---------------------------------------------------------------------------
+
+describe("Test R — Readiness prod_candidate: >90% success + <3 consecutive errors", () => {
+  test("high success rate with 0 consecutive errors → prod_candidate or higher", () => {
+    const ledger = mkLedger();
+
+    // 29 done, 1 failed = 96.7% success / 3.3% error rate (clearly < 5%)
+    // Done tasks are most recent → 0 consecutive errors at head of history
+    for (let i = 0; i < 29; i++) {
+      const t = generateTaskId("phone");
+      ledger.createOutbox({ taskId: t, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "q", payloadSummary: "x" });
+      ledger.updateOutbox(t, { deliveryState: "done", resultAt: new Date(Date.now() - i * 1000).toISOString() });
+    }
+    // 1 failed but NOT the most recent (so 0 consecutive errors from head)
+    const tFail = generateTaskId("phone");
+    ledger.createOutbox({ taskId: tFail, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "q", payloadSummary: "x" });
+    ledger.updateOutbox(tFail, { deliveryState: "failed", resultAt: new Date(Date.now() - 60_000).toISOString() });
+
+    const r = ledger.getReadiness();
+    const acceptableLevels: ReadinessLevel[] = ["prod_candidate", "prod_ready"];
+    assert.ok(acceptableLevels.includes(r.currentLevel),
+      `should be prod_candidate or prod_ready, got ${r.currentLevel}`);
+
+    ledger.close();
+  });
+
+  test("3 consecutive errors blocks prod_candidate", () => {
+    const ledger = mkLedger();
+
+    // 20 done, then 3 consecutive failures (most recent)
+    for (let i = 0; i < 20; i++) {
+      const t = generateTaskId("phone");
+      ledger.createOutbox({ taskId: t, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "q", payloadSummary: "x" });
+      ledger.updateOutbox(t, { deliveryState: "done", resultAt: new Date(Date.now() - (6 + i) * 1000).toISOString() });
+    }
+    for (let i = 0; i < 3; i++) {
+      const t = generateTaskId("phone");
+      ledger.createOutbox({ taskId: t, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "q", payloadSummary: "x" });
+      ledger.updateOutbox(t, { deliveryState: "failed", resultAt: new Date(Date.now() - (3 - i) * 1000).toISOString() });
+    }
+
+    const r = ledger.getReadiness();
+    assert.ok(r.blockingIssues.some((i) => i.includes("consecutive errors")),
+      "should report consecutive errors as blocking");
+    assert.ok(r.currentLevel !== "prod_candidate" && r.currentLevel !== "prod_ready",
+      `should not be prod_candidate/ready with 3 consecutive errors, got ${r.currentLevel}`);
+
+    ledger.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test S: Readiness — prod_ready level
+// ---------------------------------------------------------------------------
+
+describe("Test S — Readiness prod_ready: >50 done + <1% DLQ rate", () => {
+  test(">50 done tasks, 0 DLQ, >95% success → prod_ready", () => {
+    const ledger = mkLedger();
+    const baseTime = Date.now();
+
+    // 55 done, 2 failed (96.5% success, 0 DLQ) — most recent is done
+    for (let i = 0; i < 55; i++) {
+      const t = generateTaskId("phone");
+      ledger.createOutbox({ taskId: t, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "q", payloadSummary: "x" });
+      ledger.updateOutbox(t, { deliveryState: "done", resultAt: new Date(baseTime - i * 1000).toISOString() });
+    }
+    for (let i = 0; i < 2; i++) {
+      const t = generateTaskId("phone");
+      ledger.createOutbox({ taskId: t, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "q", payloadSummary: "x" });
+      ledger.updateOutbox(t, { deliveryState: "failed", resultAt: new Date(baseTime - (60 + i) * 1000).toISOString() });
+    }
+
+    const r = ledger.getReadiness();
+    assert.equal(r.currentLevel, "prod_ready",
+      `expected prod_ready, got ${r.currentLevel}\nblockers: ${JSON.stringify(r.blockingIssues)}\nwarnings: ${JSON.stringify(r.warningIssues)}`);
+    assert.equal(r.blockingIssues.length, 0, "no blocking issues for prod_ready");
+
+    ledger.close();
+  });
+
+  test("insufficient volume (<50 done) stays at prod_candidate with warning", () => {
+    const ledger = mkLedger();
+    const baseTime = Date.now();
+
+    // 30 done, 0 failed — not enough volume for prod_ready
+    for (let i = 0; i < 30; i++) {
+      const t = generateTaskId("phone");
+      ledger.createOutbox({ taskId: t, delegationId: randomUUID(), senderNode: "phone", targetNode: "vm-main", taskType: "q", payloadSummary: "x" });
+      ledger.updateOutbox(t, { deliveryState: "done", resultAt: new Date(baseTime - i * 1000).toISOString() });
+    }
+
+    const r = ledger.getReadiness();
+    assert.equal(r.currentLevel, "prod_candidate",
+      `expected prod_candidate, got ${r.currentLevel}`);
+    assert.ok(r.warningIssues.some((w) => w.includes("50")),
+      "should warn about insufficient volume");
+
+    ledger.close();
+  });
+
+  test("getReadiness returns all required fields", () => {
+    const ledger = mkLedger();
+    const r = ledger.getReadiness();
+
+    assert.ok("currentLevel" in r, "missing currentLevel");
+    assert.ok("blockingIssues" in r, "missing blockingIssues");
+    assert.ok("warningIssues" in r, "missing warningIssues");
+    assert.ok("last24hSummary" in r, "missing last24hSummary");
+    assert.ok("recommendation" in r, "missing recommendation");
+
+    const s = r.last24hSummary;
+    assert.ok("totalSent" in s, "missing last24hSummary.totalSent");
+    assert.ok("totalDone" in s, "missing last24hSummary.totalDone");
+    assert.ok("totalFailed" in s, "missing last24hSummary.totalFailed");
+    assert.ok("totalDeadLettered" in s, "missing last24hSummary.totalDeadLettered");
+    assert.ok("duplicateBlocked" in s, "missing last24hSummary.duplicateBlocked");
 
     ledger.close();
   });

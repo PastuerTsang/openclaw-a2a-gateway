@@ -1131,6 +1131,49 @@ const plugin = {
       respond(true, result);
     });
 
+    // Production observability — health metrics (P2)
+    api.registerGatewayMethod("a2a.delegate.ledger.health", ({ respond }) => {
+      if (!delegationLedger) {
+        respond(false, { error: "delegation ledger is not enabled" });
+        return;
+      }
+      respond(true, delegationLedger.getHealthMetrics());
+    });
+
+    // Production readiness gating (P3)
+    api.registerGatewayMethod("a2a.delegate.ledger.readiness", ({ respond }) => {
+      if (!delegationLedger) {
+        respond(false, { error: "delegation ledger is not enabled" });
+        return;
+      }
+      respond(true, delegationLedger.getReadiness());
+    });
+
+    // Duplicate shell governance — list (P1)
+    api.registerGatewayMethod("a2a.delegate.ledger.shells", ({ params, respond }) => {
+      if (!delegationLedger) {
+        respond(false, { error: "delegation ledger is not enabled" });
+        return;
+      }
+      const payload = asObject(params);
+      const includeClean = payload.includeClean === true;
+      respond(true, { shells: delegationLedger.listDuplicateShells(includeClean) });
+    });
+
+    // Duplicate shell governance — clean old shells (P1)
+    api.registerGatewayMethod("a2a.delegate.ledger.shells.clean", ({ params, respond }) => {
+      if (!delegationLedger) {
+        respond(false, { error: "delegation ledger is not enabled" });
+        return;
+      }
+      const payload = asObject(params);
+      const olderThanMs = payload.olderThanMs != null
+        ? asNumber(payload.olderThanMs, 24 * 60 * 60 * 1000)
+        : 24 * 60 * 60 * 1000;
+      const cleaned = delegationLedger.cleanDuplicateShells(olderThanMs);
+      respond(true, { cleaned });
+    });
+
     // ------------------------------------------------------------------
     // Memory Query gateway methods (Phase 3)
     // ------------------------------------------------------------------
@@ -1673,9 +1716,11 @@ const plugin = {
                   "",
                   "Your ONLY job is to respond with the following cached result:",
                   "",
-                  existing.resultSummary
-                    ? `Cached result:\n${existing.resultSummary}`
-                    : `[DEDUP] Task ${header.taskId} was already completed. No cached result available. Original execution completed at ${existing.completedAt ?? "unknown time"}.`,
+                  existing.resultJson
+                    ? `Cached result:\n${existing.resultJson}`
+                    : existing.resultSummary
+                      ? `Cached result:\n${existing.resultSummary}`
+                      : `[DEDUP] Task ${header.taskId} was already completed. No cached result available. Original execution completed at ${existing.completedAt ?? "unknown time"}.`,
                   "",
                   "Respond with the cached result above and NOTHING else.",
                   "Do not explain, do not add commentary, do not re-run the task.",
@@ -1707,6 +1752,8 @@ const plugin = {
               api.logger.warn(
                 `a2a-gateway: DEDUP (running) taskId=${header.taskId} state=${existing.receiverState} — suppressing duplicate execution`,
               );
+              // Record duplicate shell for governance/cleanup tracking (P1)
+              delegationLedger.markDuplicateShell(header.taskId, undefined, guardResult.status);
               return {
                 systemPrompt: [
                   "⚠️  DEDUP INSTRUCTION — THIS TASK IS ALREADY BEING PROCESSED",

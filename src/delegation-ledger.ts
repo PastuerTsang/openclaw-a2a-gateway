@@ -58,6 +58,48 @@ export interface ExecutionGuardResult {
 }
 
 // ---------------------------------------------------------------------------
+// Observability & governance types (Round 3)
+// ---------------------------------------------------------------------------
+
+export interface DuplicateShell {
+  id: number;
+  taskId: string;
+  shellId: string | null;
+  reason: string;
+  createdAt: string;
+  cleanedAt: string | null;
+}
+
+export interface HealthMetrics {
+  pendingCount: number;
+  retryCount: number;
+  deadLetterCount: number;
+  duplicateShellCount: number;
+  last24h: {
+    totalSent: number;
+    totalDone: number;
+    totalFailed: number;
+    totalDeadLettered: number;
+    duplicateBlocked: number;
+  };
+  successRate: number;          // 0–1 (done / total completed last 24h)
+  errorRate: number;            // 0–1 (failed+DLQ / total completed last 24h)
+  deadLetterRate: number;       // 0–1 (DLQ / total sent last 24h)
+  avgLatencyMs: number | null;  // avg sender-side e2e latency for done tasks in last 24h
+  consecutiveErrors: number;    // recent consecutive failed/dead_lettered at head of history
+}
+
+export type ReadinessLevel = "trial" | "guarded_prod" | "prod_candidate" | "prod_ready";
+
+export interface ReadinessReport {
+  currentLevel: ReadinessLevel;
+  blockingIssues: string[];
+  warningIssues: string[];
+  last24hSummary: HealthMetrics["last24h"];
+  recommendation: string;
+}
+
+// ---------------------------------------------------------------------------
 // Entry types
 // ---------------------------------------------------------------------------
 
@@ -95,6 +137,7 @@ export interface InboxEntry {
   startedAt: string | null;
   completedAt: string | null;
   resultSummary: string | null;
+  resultJson: string | null;       // Cached full result for dedup replay (P0)
   errorCode: string | null;
   errorMessage: string | null;
 }
@@ -201,6 +244,7 @@ const SCHEMA_BASE = `
     started_at       TEXT,
     completed_at     TEXT,
     result_summary   TEXT,
+    result_json      TEXT,
     error_code       TEXT,
     error_message    TEXT
   );
@@ -217,6 +261,18 @@ const SCHEMA_BASE = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_events_task ON delegated_events(task_id);
+
+  CREATE TABLE IF NOT EXISTS duplicate_shells (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      TEXT NOT NULL,
+    shell_id     TEXT,
+    reason       TEXT NOT NULL DEFAULT 'duplicate',
+    created_at   TEXT NOT NULL,
+    cleaned_at   TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_shells_task    ON duplicate_shells(task_id);
+  CREATE INDEX IF NOT EXISTS idx_shells_cleaned ON duplicate_shells(cleaned_at);
 `;
 
 // ---------------------------------------------------------------------------
@@ -260,6 +316,7 @@ function rowToInbox(row: Record<string, unknown>): InboxEntry {
     startedAt:     row["started_at"] != null ? String(row["started_at"]) : null,
     completedAt:   row["completed_at"] != null ? String(row["completed_at"]) : null,
     resultSummary: row["result_summary"] != null ? String(row["result_summary"]) : null,
+    resultJson:    row["result_json"] != null ? String(row["result_json"]) : null,
     errorCode:     row["error_code"] != null ? String(row["error_code"]) : null,
     errorMessage:  row["error_message"] != null ? String(row["error_message"]) : null,
   };
@@ -293,6 +350,8 @@ export class DelegationLedger {
         // Column already exists — expected for new databases
       }
     }
+    // result_json (added in v3 — P0 result caching)
+    try { this.db.exec("ALTER TABLE delegated_inbox ADD COLUMN result_json TEXT"); } catch { /* exists */ }
   }
 
   close(): void {
@@ -595,7 +654,7 @@ export class DelegationLedger {
   }
 
   updateInbox(taskId: string, updates: Partial<Pick<InboxEntry,
-    "receiverState" | "startedAt" | "completedAt" | "resultSummary" | "errorCode" | "errorMessage"
+    "receiverState" | "startedAt" | "completedAt" | "resultSummary" | "resultJson" | "errorCode" | "errorMessage"
   >>): void {
     const fields: string[] = [];
     const values: (string | null)[] = [];
@@ -604,6 +663,7 @@ export class DelegationLedger {
     if (updates.startedAt      !== undefined) { fields.push("started_at = ?");      values.push(updates.startedAt); }
     if (updates.completedAt    !== undefined) { fields.push("completed_at = ?");    values.push(updates.completedAt); }
     if (updates.resultSummary  !== undefined) { fields.push("result_summary = ?");  values.push(updates.resultSummary); }
+    if (updates.resultJson     !== undefined) { fields.push("result_json = ?");     values.push(updates.resultJson); }
     if (updates.errorCode      !== undefined) { fields.push("error_code = ?");      values.push(updates.errorCode); }
     if (updates.errorMessage   !== undefined) { fields.push("error_message = ?");   values.push(updates.errorMessage); }
 
@@ -721,6 +781,282 @@ export class DelegationLedger {
       inboxRunningCount,
       recentDeadLetters,
       recentPending,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // P0: Result caching — record full result so duplicate_done can replay it
+  // -------------------------------------------------------------------------
+
+  /**
+   * Atomically record the execution result for an inbox task.
+   * Stores resultJson + resultSummary + state so that subsequent
+   * tryClaimExecution() calls on the same taskId return the cached result.
+   */
+  recordInboxResult(taskId: string, result: {
+    receiverState: "done" | "failed" | "partial";
+    resultJson?: string | null;
+    resultSummary?: string | null;
+    errorCode?: string | null;
+    errorMessage?: string | null;
+  }): void {
+    const now = new Date().toISOString();
+    this.db.prepare(`
+      UPDATE delegated_inbox
+      SET receiver_state = ?, result_json = ?, result_summary = ?,
+          error_code = ?, error_message = ?, completed_at = ?
+      WHERE task_id = ?
+    `).run(
+      result.receiverState,
+      result.resultJson ?? null,
+      result.resultSummary ?? null,
+      result.errorCode ?? null,
+      result.errorMessage ?? null,
+      now,
+      taskId,
+    );
+    this.addEvent(taskId, "result_recorded", { state: result.receiverState });
+  }
+
+  // -------------------------------------------------------------------------
+  // P1: Duplicate shell governance
+  // -------------------------------------------------------------------------
+
+  /**
+   * Record a duplicate shell task created by the SDK before dedup fired.
+   * shellId is the SDK-assigned task ID for the duplicate shell.
+   */
+  markDuplicateShell(taskId: string, shellId?: string, reason = "duplicate"): void {
+    this.db.prepare(`
+      INSERT INTO duplicate_shells (task_id, shell_id, reason, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(taskId, shellId ?? null, reason, new Date().toISOString());
+  }
+
+  /**
+   * List recorded duplicate shells.
+   * By default excludes cleaned entries.
+   */
+  listDuplicateShells(includeClean = false, limit = 100): DuplicateShell[] {
+    const where = includeClean ? "" : "WHERE cleaned_at IS NULL";
+    const rows = this.db.prepare(`
+      SELECT * FROM duplicate_shells ${where} ORDER BY created_at DESC LIMIT ?
+    `).all(limit);
+    return (rows as Record<string, unknown>[]).map((row) => ({
+      id:        Number(row["id"] ?? 0),
+      taskId:    String(row["task_id"] ?? ""),
+      shellId:   row["shell_id"] != null ? String(row["shell_id"]) : null,
+      reason:    String(row["reason"] ?? ""),
+      createdAt: String(row["created_at"] ?? ""),
+      cleanedAt: row["cleaned_at"] != null ? String(row["cleaned_at"]) : null,
+    }));
+  }
+
+  /**
+   * Mark duplicate shells older than olderThanMs as cleaned.
+   * Returns the count of shells cleaned.
+   */
+  cleanDuplicateShells(olderThanMs = 24 * 60 * 60 * 1000): number {
+    const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+    const now = new Date().toISOString();
+    const result = this.db.prepare(`
+      UPDATE duplicate_shells
+      SET cleaned_at = ?
+      WHERE created_at <= ? AND cleaned_at IS NULL
+    `).run(now, cutoff);
+    return Number((result as { changes: number }).changes ?? 0);
+  }
+
+  // -------------------------------------------------------------------------
+  // P2: Production observability — health metrics
+  // -------------------------------------------------------------------------
+
+  /**
+   * Returns production health metrics including:
+   * - pending/retry/dead-letter counts (current snapshot)
+   * - last 24h totals (sent, done, failed, DLQ, duplicate_blocked)
+   * - success/error/DLQ rates
+   * - avg e2e latency for done tasks
+   * - consecutive error count at head of recent history
+   */
+  getHealthMetrics(): HealthMetrics {
+    const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    // Current snapshot counts
+    const stats = this.getStats();
+    const pendingCount =
+      (stats["outbox_queued"] ?? 0) +
+      (stats["outbox_sending"] ?? 0) +
+      (stats["outbox_awaiting_ack"] ?? 0) +
+      (stats["outbox_awaiting_result"] ?? 0) +
+      (stats["outbox_acked"] ?? 0);
+    const retryCount = stats["outbox_retry_scheduled"] ?? 0;
+    const deadLetterCount = stats["outbox_dead_lettered"] ?? 0;
+
+    // Duplicate shells (uncleaned)
+    const shellCountRow = this.db.prepare(
+      "SELECT COUNT(*) as cnt FROM duplicate_shells WHERE cleaned_at IS NULL"
+    ).get() as { cnt: number };
+    const duplicateShellCount = Number(shellCountRow?.cnt ?? 0);
+
+    // Last 24h outbox stats
+    const totalSent = Number(
+      (this.db.prepare("SELECT COUNT(*) as cnt FROM delegated_outbox WHERE created_at >= ?").get(since24h) as { cnt: number })?.cnt ?? 0
+    );
+    const totalDone = Number(
+      (this.db.prepare("SELECT COUNT(*) as cnt FROM delegated_outbox WHERE delivery_state = 'done' AND result_at >= ?").get(since24h) as { cnt: number })?.cnt ?? 0
+    );
+    const totalFailed = Number(
+      (this.db.prepare("SELECT COUNT(*) as cnt FROM delegated_outbox WHERE delivery_state = 'failed' AND result_at >= ?").get(since24h) as { cnt: number })?.cnt ?? 0
+    );
+    const totalDeadLettered = Number(
+      (this.db.prepare(
+        "SELECT COUNT(*) as cnt FROM delegated_outbox WHERE delivery_state = 'dead_lettered' AND last_attempt_at >= ?"
+      ).get(since24h) as { cnt: number })?.cnt ?? 0
+    );
+    const duplicateBlocked = Number(
+      (this.db.prepare(
+        "SELECT COUNT(*) as cnt FROM delegated_events WHERE event_type = 'execution_guard_rejected' AND created_at >= ?"
+      ).get(since24h) as { cnt: number })?.cnt ?? 0
+    );
+
+    // Rates
+    const totalCompleted = totalDone + totalFailed + totalDeadLettered;
+    const successRate  = totalCompleted > 0 ? totalDone / totalCompleted : 0;
+    const errorRate    = totalCompleted > 0 ? (totalFailed + totalDeadLettered) / totalCompleted : 0;
+    const deadLetterRate = totalSent > 0 ? totalDeadLettered / totalSent : 0;
+
+    // Avg e2e sender-side latency for done tasks in last 24h (ms)
+    const latencyRow = this.db.prepare(`
+      SELECT AVG((julianday(result_at) - julianday(created_at)) * 86400000) as avg_ms
+      FROM delegated_outbox
+      WHERE delivery_state = 'done' AND result_at IS NOT NULL AND result_at >= ?
+    `).get(since24h) as { avg_ms: number | null };
+    const avgLatencyMs = latencyRow?.avg_ms != null ? Number(latencyRow.avg_ms) : null;
+
+    // Consecutive errors at head of recent completion history
+    const recentRows = this.db.prepare(`
+      SELECT delivery_state FROM delegated_outbox
+      WHERE delivery_state IN ('done', 'failed', 'dead_lettered')
+        AND (result_at IS NOT NULL OR last_attempt_at IS NOT NULL)
+      ORDER BY COALESCE(result_at, last_attempt_at) DESC
+      LIMIT 20
+    `).all() as Array<{ delivery_state: string }>;
+
+    let consecutiveErrors = 0;
+    for (const row of recentRows) {
+      if (row.delivery_state === "failed" || row.delivery_state === "dead_lettered") {
+        consecutiveErrors++;
+      } else {
+        break;
+      }
+    }
+
+    return {
+      pendingCount,
+      retryCount,
+      deadLetterCount,
+      duplicateShellCount,
+      last24h: {
+        totalSent,
+        totalDone,
+        totalFailed,
+        totalDeadLettered,
+        duplicateBlocked,
+      },
+      successRate,
+      errorRate,
+      deadLetterRate,
+      avgLatencyMs,
+      consecutiveErrors,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // P3: Production readiness gating
+  // -------------------------------------------------------------------------
+
+  /**
+   * Evaluate production readiness level.
+   *
+   * Levels (ascending):
+   *   trial          — baseline, no criteria satisfied
+   *   guarded_prod   — 0 DLQ in 24h + error rate < 5%
+   *   prod_candidate — guarded_prod + success rate > 90% + < 3 consecutive errors
+   *   prod_ready     — prod_candidate + > 50 done in 24h + DLQ rate < 1%
+   */
+  getReadiness(): ReadinessReport {
+    const metrics = this.getHealthMetrics();
+    const { last24h, successRate, deadLetterRate, consecutiveErrors } = metrics;
+
+    const blockingIssues: string[] = [];
+    const warningIssues: string[] = [];
+
+    // Criteria checks
+    // guarded_prod requires at least some real activity (totalSent > 0)
+    const isGuardedProd =
+      last24h.totalSent > 0 &&
+      last24h.totalDeadLettered === 0 &&
+      metrics.errorRate < 0.05;
+
+    const isProdCandidate =
+      isGuardedProd &&
+      successRate > 0.90 &&
+      consecutiveErrors < 3;
+
+    const isProdReady =
+      isProdCandidate &&
+      last24h.totalDone > 50 &&
+      deadLetterRate < 0.01;
+
+    let currentLevel: ReadinessLevel = "trial";
+    if (isProdReady)      currentLevel = "prod_ready";
+    else if (isProdCandidate) currentLevel = "prod_candidate";
+    else if (isGuardedProd)   currentLevel = "guarded_prod";
+
+    // Blocking issues (prevent promotion)
+    if (last24h.totalDeadLettered > 0) {
+      blockingIssues.push(`${last24h.totalDeadLettered} dead-lettered task(s) in last 24h`);
+    }
+    if (last24h.totalSent > 0 && metrics.errorRate >= 0.05) {
+      blockingIssues.push(`Error rate ${(metrics.errorRate * 100).toFixed(1)}% exceeds 5% threshold`);
+    }
+    if (consecutiveErrors >= 3) {
+      blockingIssues.push(`${consecutiveErrors} consecutive errors detected`);
+    }
+
+    // Warnings (sub-optimal but not blocking)
+    if (currentLevel === "prod_candidate" && last24h.totalDone <= 50) {
+      warningIssues.push(`Only ${last24h.totalDone} successful tasks in last 24h (need >50 for prod_ready)`);
+    }
+    if (currentLevel === "prod_candidate" && deadLetterRate >= 0.01) {
+      warningIssues.push(`Dead-letter rate ${(deadLetterRate * 100).toFixed(2)}% exceeds 1% threshold for prod_ready`);
+    }
+    if (consecutiveErrors > 0 && consecutiveErrors < 3) {
+      warningIssues.push(`${consecutiveErrors} consecutive error(s) — watch for escalation`);
+    }
+    if (metrics.retryCount > 0) {
+      warningIssues.push(`${metrics.retryCount} task(s) pending retry`);
+    }
+
+    // Recommendation
+    let recommendation: string;
+    if (currentLevel === "prod_ready") {
+      recommendation = "System is production-ready. Continue monitoring.";
+    } else if (currentLevel === "prod_candidate") {
+      recommendation = "Candidate for production. Accumulate >50 successful tasks with DLQ rate <1%.";
+    } else if (currentLevel === "guarded_prod") {
+      recommendation = "Safe for guarded production use. Improve success rate above 90% for prod_candidate.";
+    } else {
+      recommendation = "Trial mode. Resolve blocking issues before promoting.";
+    }
+
+    return {
+      currentLevel,
+      blockingIssues,
+      warningIssues,
+      last24hSummary: last24h,
+      recommendation,
     };
   }
 }
