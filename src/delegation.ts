@@ -249,7 +249,7 @@ export class DelegationManager {
         return { ...result };
       }
 
-      if (state === "failed" || state === "canceled") {
+      if (state === "failed" || state === "canceled" || state === "rejected") {
         result.status = "failed";
         result.error = extractTaskError(task) || `Remote task ${state}`;
         result.completedAt = new Date().toISOString();

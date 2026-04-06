@@ -40,6 +40,8 @@ export interface LearningSyncConfig {
   instanceName: string;
   /** Auto-sync interval in seconds (0 = disabled) */
   autoSyncIntervalSeconds: number;
+  /** Exact filenames to exclude from learning sync (manifest, fetch, search) */
+  excludeFiles?: string[];
 }
 
 /** A section parsed from a daily memory file. */
@@ -376,6 +378,10 @@ export class LearningSyncManager {
     };
   }
 
+  private isExcluded(name: string): boolean {
+    return Array.isArray(this.config.excludeFiles) && this.config.excludeFiles.includes(name);
+  }
+
   /** Ensure memory directory exists. */
   private ensureDir(): void {
     if (!fs.existsSync(this.config.memoryDir)) {
@@ -390,6 +396,7 @@ export class LearningSyncManager {
 
     for (const name of fs.readdirSync(this.config.memoryDir)) {
       if (!isMemoryFile(name)) continue;
+      if (this.isExcluded(name)) continue;
       const fullPath = path.join(this.config.memoryDir, name);
       const stat = fs.statSync(fullPath);
       if (!stat.isFile()) continue;
@@ -408,6 +415,7 @@ export class LearningSyncManager {
   /** Read a specific memory file by name. Returns null if not found. */
   readFile(name: string): string | null {
     if (!isMemoryFile(name)) return null;
+    if (this.isExcluded(name)) return null;
     const fullPath = path.join(this.config.memoryDir, name);
     if (!fs.existsSync(fullPath)) return null;
     return fs.readFileSync(fullPath, "utf8");
@@ -555,6 +563,7 @@ export class LearningSyncManager {
     for (const name of fs.readdirSync(this.config.memoryDir)) {
       if (!isMemoryFile(name)) continue;
       if (!isSafeForRecall(name)) continue;
+      if (this.isExcluded(name)) continue;
 
       // Date filter
       if (opts.date && !name.startsWith(opts.date)) continue;

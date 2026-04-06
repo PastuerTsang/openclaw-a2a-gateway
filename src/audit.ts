@@ -33,11 +33,16 @@ export class AuditLogger {
   }
 
   async record(entry: AuditEntry): Promise<void> {
-    await this.ensureDir();
-    const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-    const filePath = path.join(this.auditDir, `audit-${date}.jsonl`);
-    const line = JSON.stringify(entry) + "\n";
-    await fs.promises.appendFile(filePath, line, "utf-8");
+    try {
+      await this.ensureDir();
+      const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      const filePath = path.join(this.auditDir, `audit-${date}.jsonl`);
+      const line = JSON.stringify(entry) + "\n";
+      await fs.promises.appendFile(filePath, line, "utf-8");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[a2a-gateway] audit write failed: ${msg}\n`);
+    }
   }
 
   private ensureDir(): Promise<void> {

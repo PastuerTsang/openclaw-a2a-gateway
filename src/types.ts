@@ -124,6 +124,8 @@ export interface LearningSyncGatewayConfig {
   instanceName: string;
   /** Auto-sync interval in seconds (0 = disabled, default 300 = 5 min). */
   autoSyncIntervalSeconds: number;
+  /** Exact filenames to exclude from learning sync. */
+  excludeFiles: string[];
 }
 
 // ---------------------------------------------------------------------------

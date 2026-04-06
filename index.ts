@@ -280,6 +280,9 @@ function parseConfig(raw: unknown, resolvePath?: (nextPath: string) => string): 
       ),
       instanceName: asString(learningSync.instanceName, "") || os.hostname(),
       autoSyncIntervalSeconds: Math.max(0, asNumber(learningSync.autoSyncIntervalSeconds, 300)),
+      excludeFiles: Array.isArray(learningSync.excludeFiles)
+        ? learningSync.excludeFiles.filter((f: unknown) => typeof f === "string") as string[]
+        : [],
     },
     delegation: {
       enabled: asBoolean(delegation.enabled, false),
@@ -339,6 +342,7 @@ const plugin = {
             memoryDir: config.learningSync.memoryDir,
             instanceName: config.learningSync.instanceName,
             autoSyncIntervalSeconds: config.learningSync.autoSyncIntervalSeconds,
+            excludeFiles: config.learningSync.excludeFiles,
           },
           api.logger,
         )
