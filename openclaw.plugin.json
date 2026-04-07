@@ -278,6 +278,11 @@
             "default": 300,
             "minimum": 0,
             "description": "Auto-sync interval in seconds (0 = manual only, default 300 = 5 min)"
+          },
+          "excludeFiles": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "File names to exclude from learning sync"
           }
         }
       },
