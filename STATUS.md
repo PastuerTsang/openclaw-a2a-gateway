@@ -1,5 +1,5 @@
 ---
-lastUpdated: "2026-04-02T18:00:00+00:00"
+lastUpdated: "2026-04-09T17:00:00+00:00"
 updatedBy: "VM-Main"
 ---
 
@@ -19,6 +19,7 @@ updatedBy: "VM-Main"
 
 ## 近期變更
 ### VM-Main
+- 2026-04-09: fix: 雙 provider rate limit 根因診斷與修復 — memory-lancedb-pro 加 cooldown guard patch（reflection + smartExtraction 在 provider cooldown 時 skip）+ thinkingDefault off + heartbeat 關閉 + memorySearch 開啟 + 手機端 crash-loop 修復（supervisor max retry + backoff, 不用 --force）+ OpenAI profile 整理
 - 2026-04-02: ops: openclaw doctor 全清 — interpreter 安全收斂（bash/awk/sed/jq 移出 safeBins，python3/node 加限制 profile）+ ~/.claude Stop hook 自動提醒 /clear /compact
 - 2026-04-02: feat: workspace 三層記憶架構落地 — decisions/(ADR) + shared/(協作層) + 治理文件分工收斂；補齊 bootstrap-extra-files hook + exec allowlist + approval 關閉；SOUL.md 語言規則 + self-improvement 量化晉升觸發
 - 2026-03-30: feat: AI 董事會案件提報系統 MVP v1 上線 — Google Form(7欄)+Sheet(28欄)+Gemini AI 自動處理+systemd timer 每2分鐘掃描 + GOG CLI v0.12.0 安裝授權 + 逾期審計三項落地（交付檢核清單+收尾檢核清單+4施工件）+ daily-health-check 改 gpt-5.4 + Telegram failure alert
